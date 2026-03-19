@@ -1,4 +1,4 @@
-#include "llama-arch.h"
+﻿#include "llama-arch.h"
 
 #include "llama-impl.h"
 
@@ -138,6 +138,8 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_KIMI_LINEAR,      "kimi-linear"      },
     { LLM_ARCH_TALKIE,           "talkie"           },
     { LLM_ARCH_MELLUM,           "mellum"           },
+    { LLM_ARCH_QWEN3TTS,         "qwen3tts"         },
+    { LLM_ARCH_QWEN3TTS_CP,      "qwen3tts-cp"      },
     { LLM_ARCH_UNKNOWN,          "(unknown)"        },
 };
 
@@ -468,6 +470,15 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_NEXTN_HNORM,                            "blk.%d.nextn.hnorm" },
     { LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,                 "blk.%d.nextn.shared_head_head" },
     { LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,                 "blk.%d.nextn.shared_head_norm" },
+    { LLM_TENSOR_TTS_TEXT_EMBD,                          "tts.text_embd" },
+    { LLM_TENSOR_TTS_TEXT_PROJ_UP,                       "tts.text_proj_up" },
+    { LLM_TENSOR_TTS_TEXT_PROJ_GATE,                     "tts.text_proj_gate" },
+    { LLM_TENSOR_TTS_TEXT_PROJ_DOWN,                     "tts.text_proj_down" },
+    { LLM_TENSOR_TTS_CODEC_EMBD,                        "tts.codec_embd" },
+    { LLM_TENSOR_TTS_CODEC_HEAD,                         "tts.codec_head" },
+    { LLM_TENSOR_TTS_CP_CODEC_EMBD,                     "tts.cp.codec_embd.%d" },
+    { LLM_TENSOR_TTS_CP_LM_HEAD,                        "tts.cp.lm_head.%d" },
+    { LLM_TENSOR_TTS_CP_SMALL_TO_MTP,                   "tts.cp.small_to_mtp" },
     { LLM_TENSOR_ATTN_SUB_NORM,                          "blk.%d.attn_sub_norm" },
     { LLM_TENSOR_FFN_SUB_NORM,                           "blk.%d.ffn_sub_norm" },
     { LLM_TENSOR_DEC_OUTPUT_NORM,                        "dec.output_norm" },
