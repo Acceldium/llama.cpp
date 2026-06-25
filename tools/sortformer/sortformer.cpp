@@ -19,6 +19,7 @@
 #include <complex>
 #include <fstream>
 #include <stdexcept>
+#include <functional>
 
 #ifndef NOMINMAX
 #define NOMINMAX            // miniaudio pulls in windows.h; keep std::min/std::max usable
@@ -126,15 +127,168 @@ static double max_abs_diff(const float * a, const float * b, size_t n, double * 
     if (mean) *mean = sm/(double)std::max<size_t>(1,n); return mx;
 }
 
+// ----------------------------------------------------------------- shared graph builders
+using WFn = std::function<ggml_tensor*(const char*)>;
+
+// Conformer subsampling stem (dw_striding): mel_in [T,F,1,1] -> pre-encode embeddings [512, Tsub]
+static ggml_tensor * build_stem(ggml_context * ctx0, const WFn & W, ggml_tensor * mel_in) {
+    auto bcast = [&](ggml_tensor * b){ return ggml_reshape_4d(ctx0, b, 1,1,b->ne[0],1); };
+    ggml_tensor * cur = ggml_cont(ctx0, ggml_transpose(ctx0, mel_in));          // [F,T,1,1]
+    cur = ggml_conv_2d_direct(ctx0, W("enc.pre.c0.w"), cur, 2,2,1,1,1,1);        // f32 (avoid f16 im2col)
+    cur = ggml_add(ctx0, cur, bcast(W("enc.pre.c0.b"))); cur = ggml_relu(ctx0, cur);
+    cur = ggml_conv_2d_dw_direct(ctx0, W("enc.pre.c2.w"), cur, 2,2,1,1,1,1);
+    cur = ggml_add(ctx0, cur, bcast(W("enc.pre.c2.b")));
+    cur = ggml_conv_2d_direct(ctx0, W("enc.pre.c3.w"), cur, 1,1,0,0,1,1);
+    cur = ggml_add(ctx0, cur, bcast(W("enc.pre.c3.b"))); cur = ggml_relu(ctx0, cur);
+    cur = ggml_conv_2d_dw_direct(ctx0, W("enc.pre.c5.w"), cur, 2,2,1,1,1,1);
+    cur = ggml_add(ctx0, cur, bcast(W("enc.pre.c5.b")));
+    cur = ggml_conv_2d_direct(ctx0, W("enc.pre.c6.w"), cur, 1,1,0,0,1,1);
+    cur = ggml_add(ctx0, cur, bcast(W("enc.pre.c6.b"))); cur = ggml_relu(ctx0, cur);
+    cur = ggml_cont(ctx0, ggml_permute(ctx0, cur, 0, 2, 1, 3));                 // [Wf, C, Ht, 1]
+    cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]);        // [Wf*C, Ht]
+    cur = ggml_mul_mat(ctx0, W("enc.pre.out.w"), cur);                          // [512, Tsub]
+    return ggml_add(ctx0, cur, W("enc.pre.out.b"));
+}
+
+// one Conformer macaron block (rel-pos MHSA + conv module); cur [512,T] -> [512,T]
+static ggml_tensor * build_conformer_block(ggml_context * ctx0, const WFn & W, int il,
+                                           ggml_tensor * cur, ggml_tensor * pos_emb, int n_head, int d_head) {
+    const int Dm = (int)cur->ne[0];
+    char p[40]; auto N = [&](const char* s){ snprintf(p,sizeof p,"enc.%d.%s",il,s); return W(p); };
+    auto norm = [&](ggml_tensor* x, const char* wn, const char* bn){
+        x = ggml_norm(ctx0, x, 1e-5f); return ggml_add(ctx0, ggml_mul(ctx0, x, N(wn)), N(bn)); };
+    ggml_tensor * residual = cur;
+    { ggml_tensor* x = norm(residual, "nff1.w", "nff1.b");                       // macaron FF1 (½)
+      x = ggml_add(ctx0, ggml_mul_mat(ctx0, N("ff1.l1.w"), x), N("ff1.l1.b"));
+      x = ggml_silu(ctx0, x);
+      x = ggml_add(ctx0, ggml_mul_mat(ctx0, N("ff1.l2.w"), x), N("ff1.l2.b"));
+      residual = ggml_add(ctx0, residual, ggml_scale(ctx0, x, 0.5f)); }
+    { ggml_tensor* c = norm(residual, "nsa.w", "nsa.b");                         // rel-pos MHSA
+      ggml_tensor* Q = ggml_add(ctx0, ggml_mul_mat(ctx0, N("attn.q.w"), c), N("attn.q.b"));
+      Q = ggml_reshape_3d(ctx0, Q, d_head, n_head, Q->ne[1]);
+      ggml_tensor* Qu = ggml_permute(ctx0, ggml_add(ctx0, Q, N("attn.bu")), 0,2,1,3);
+      ggml_tensor* Qv = ggml_permute(ctx0, ggml_add(ctx0, Q, N("attn.bv")), 0,2,1,3);
+      ggml_tensor* K = ggml_add(ctx0, ggml_mul_mat(ctx0, N("attn.k.w"), c), N("attn.k.b"));
+      K = ggml_reshape_3d(ctx0, K, d_head, n_head, K->ne[1]);
+      K = ggml_cont(ctx0, ggml_permute(ctx0, K, 0,2,1,3));
+      ggml_tensor* V = ggml_add(ctx0, ggml_mul_mat(ctx0, N("attn.v.w"), c), N("attn.v.b"));
+      V = ggml_reshape_3d(ctx0, V, d_head, n_head, V->ne[1]);
+      V = ggml_cont(ctx0, ggml_permute(ctx0, V, 1,2,0,3));
+      ggml_tensor* ac = ggml_cont(ctx0, ggml_permute(ctx0, ggml_mul_mat(ctx0, Qu, K), 1,0,2,3));
+      ggml_tensor* pp = ggml_mul_mat(ctx0, N("attn.pos.w"), pos_emb);
+      pp = ggml_reshape_3d(ctx0, pp, d_head, n_head, pp->ne[1]);
+      pp = ggml_permute(ctx0, pp, 0,2,1,3);
+      ggml_tensor* bd = ggml_cont(ctx0, ggml_permute(ctx0, ggml_mul_mat(ctx0, Qv, pp), 1,0,2,3));
+      { const int64_t pl=bd->ne[0], ql=bd->ne[1], h=bd->ne[2];                   // rel shift
+        bd = ggml_pad(ctx0, bd, 1,0,0,0);
+        bd = ggml_roll(ctx0, bd, 1,0,0,0);
+        bd = ggml_reshape_3d(ctx0, bd, ql, pl+1, h);
+        bd = ggml_view_3d(ctx0, bd, ql, pl, h, bd->nb[1], bd->nb[2], bd->nb[0]*ql);
+        bd = ggml_cont_3d(ctx0, bd, pl, ql, h); }
+      bd = ggml_view_3d(ctx0, bd, ac->ne[0], bd->ne[1], bd->ne[2], bd->nb[1], bd->nb[2], 0);
+      ggml_tensor* sc = ggml_scale(ctx0, ggml_add(ctx0, ac, bd), 1.0f/std::sqrt((float)d_head));
+      ggml_tensor* at = ggml_soft_max(ctx0, sc);
+      ggml_tensor* x = ggml_mul_mat(ctx0, at, V);
+      x = ggml_cont_2d(ctx0, ggml_permute(ctx0, x, 2,0,1,3), Dm, at->ne[1]);
+      cur = ggml_add(ctx0, ggml_mul_mat(ctx0, N("attn.o.w"), x), N("attn.o.b")); }
+    residual = ggml_add(ctx0, residual, cur);
+    { ggml_tensor* x = norm(residual, "ncv.w", "ncv.b");                         // conv module
+      x = ggml_add(ctx0, ggml_mul_mat(ctx0, ggml_reshape_2d(ctx0, N("cv.pw1.w"), Dm, 2*Dm), x), N("cv.pw1.b"));
+      { int64_t d = x->ne[0]/2;                                                  // GLU (sigmoid gate)
+        ggml_tensor* g = ggml_sigmoid(ctx0, ggml_view_2d(ctx0, x, d, x->ne[1], x->nb[1], d*x->nb[0]));
+        x = ggml_mul(ctx0, ggml_view_2d(ctx0, x, d, x->ne[1], x->nb[1], 0), g);
+        x = ggml_cont(ctx0, ggml_transpose(ctx0, x)); }
+      x = ggml_pad(ctx0, x, 4,0,0,0); x = ggml_roll(ctx0, x, 4,0,0,0); x = ggml_pad(ctx0, x, 4,0,0,0);
+      x = ggml_ssm_conv(ctx0, x, ggml_reshape_2d(ctx0, N("cv.dw.w"), 9, Dm));    // symmetric dw k9, f32
+      x = ggml_add(ctx0, x, N("cv.dw.b"));
+      x = ggml_add(ctx0, ggml_mul(ctx0, x, N("cv.bn.w")), N("cv.bn.b"));         // folded BN
+      x = ggml_silu(ctx0, x);
+      x = ggml_add(ctx0, ggml_mul_mat(ctx0, ggml_reshape_2d(ctx0, N("cv.pw2.w"), Dm, Dm), x), N("cv.pw2.b"));
+      cur = x; }
+    residual = ggml_add(ctx0, residual, cur);
+    { ggml_tensor* x = norm(residual, "nff2.w", "nff2.b");                       // macaron FF2 (½)
+      x = ggml_add(ctx0, ggml_mul_mat(ctx0, N("ff2.l1.w"), x), N("ff2.l1.b"));
+      x = ggml_silu(ctx0, x);
+      x = ggml_add(ctx0, ggml_mul_mat(ctx0, N("ff2.l2.w"), x), N("ff2.l2.b"));
+      residual = ggml_add(ctx0, residual, ggml_scale(ctx0, x, 0.5f)); }
+    return norm(residual, "nout.w", "nout.b");
+}
+
+// one post-LN Transformer block (full attn); cur [192,T] -> [192,T]
+static ggml_tensor * build_transformer_block(ggml_context * ctx0, const WFn & W, int il,
+                                             ggml_tensor * cur, int n_head, int d_head) {
+    const int H = (int)cur->ne[0], Tq = (int)cur->ne[1];
+    char p[40]; auto N = [&](const char* s){ snprintf(p,sizeof p,"tf.%d.%s",il,s); return W(p); };
+    ggml_tensor * x0 = cur;
+    ggml_tensor * Q = ggml_add(ctx0, ggml_mul_mat(ctx0, N("attn.q.w"), x0), N("attn.q.b"));
+    ggml_tensor * K = ggml_add(ctx0, ggml_mul_mat(ctx0, N("attn.k.w"), x0), N("attn.k.b"));
+    ggml_tensor * V = ggml_add(ctx0, ggml_mul_mat(ctx0, N("attn.v.w"), x0), N("attn.v.b"));
+    Q = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, Q, d_head, n_head, Tq), 0,2,1,3));
+    K = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, K, d_head, n_head, Tq), 0,2,1,3));
+    V = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, V, d_head, n_head, Tq), 1,2,0,3));
+    ggml_tensor * sc = ggml_scale(ctx0, ggml_mul_mat(ctx0, K, Q), 1.0f/std::sqrt((float)d_head));
+    sc = ggml_soft_max(ctx0, sc);
+    ggml_tensor * o = ggml_mul_mat(ctx0, V, sc);
+    o = ggml_cont_2d(ctx0, ggml_permute(ctx0, o, 0,2,1,3), H, Tq);
+    o = ggml_add(ctx0, ggml_mul_mat(ctx0, N("attn.o.w"), o), N("attn.o.b"));
+    ggml_tensor * x1 = ggml_norm(ctx0, ggml_add(ctx0, x0, o), 1e-5f);
+    x1 = ggml_add(ctx0, ggml_mul(ctx0, x1, N("ln1.w")), N("ln1.b"));
+    ggml_tensor * f = ggml_add(ctx0, ggml_mul_mat(ctx0, N("ff.in.w"), x1), N("ff.in.b"));
+    f = ggml_relu(ctx0, f);
+    f = ggml_add(ctx0, ggml_mul_mat(ctx0, N("ff.out.w"), f), N("ff.out.b"));
+    ggml_tensor * x2 = ggml_norm(ctx0, ggml_add(ctx0, x1, f), 1e-5f);
+    return ggml_add(ctx0, ggml_mul(ctx0, x2, N("ln2.w")), N("ln2.b"));
+}
+
+// speaker head: trans_out [192,T] -> sigmoid speaker probs [4,T]
+static ggml_tensor * build_speaker_head(ggml_context * ctx0, const WFn & W, ggml_tensor * trans_out,
+                                        ggml_tensor ** spk_logits_out) {
+    ggml_tensor * h = ggml_relu(ctx0, trans_out);
+    h = ggml_add(ctx0, ggml_mul_mat(ctx0, W("sm.fh2h.w"), h), W("sm.fh2h.b"));
+    h = ggml_relu(ctx0, h);
+    ggml_tensor * logits = ggml_add(ctx0, ggml_mul_mat(ctx0, W("sm.sh2s.w"), h), W("sm.sh2s.b"));
+    if (spk_logits_out) *spk_logits_out = logits;
+    return ggml_sigmoid(ctx0, logits);
+}
+
+// per-speaker activity summary + RTTM segments (P = [T,4] flat, 80ms/frame, threshold 0.5)
+static void emit_diarization(const std::vector<float> & P, int Tt, int S) {
+    printf("\nspeaker activity (frames>0.5 of %d, mean prob):\n", Tt);
+    for (int s=0;s<S;s++){ int act=0; double mp=0; for(int t=0;t<Tt;t++){ float v=P[(size_t)t*S+s]; if(v>0.5f)act++; mp+=v; }
+        printf("  spk %d: %4d frames active (%.1f%%), mean=%.4f\n", s, act, 100.0*act/Tt, mp/Tt); }
+    const double fr=0.08; const float thr=0.5f;
+    printf("\nRTTM:\n");
+    for (int s=0;s<S;s++){ int st=-1;
+        for (int t=0;t<=Tt;t++){ bool on=(t<Tt)&&P[(size_t)t*S+s]>thr;
+            if(on&&st<0)st=t;
+            else if(!on&&st>=0){ printf("SPEAKER audio 1 %.2f %.2f <NA> <NA> spk%d <NA> <NA>\n", st*fr,(t-st)*fr,s); st=-1; } } }
+}
+
+// NeMo create_pe: relative sinusoidal PE, positions (N-1)..-(N-1); host buffer [Dm, 2N-1]
+static std::vector<float> make_pos_emb(int Dm, int N) {
+    const int n_pos = 2*N - 1;
+    std::vector<float> pe((size_t)Dm*n_pos);
+    for (int pidx = 0; pidx < n_pos; pidx++) {
+        const double position = (double)(N - 1 - pidx);
+        for (int i = 0; i < Dm/2; i++) {
+            const double div = std::exp((double)(2*i) * -(std::log(10000.0)/(double)Dm));
+            pe[(size_t)pidx*Dm + 2*i]   = (float)std::sin(position*div);
+            pe[(size_t)pidx*Dm + 2*i+1] = (float)std::cos(position*div);
+        }
+    }
+    return pe;
+}
+
 int main(int argc, char ** argv) {
     std::string model = "model/sortformer.gguf";
     std::string pcm_npy = "reference/input_pcm.npy";
     std::string ref_dir = "reference_offline";
     std::string audio;          // wav/mp3/flac; takes precedence over --pcm when set
     bool validate = false;      // compare against ref_dir npy targets
+    bool stream = false;        // chunked streaming inference (AOSC speaker cache)
     for (int i = 1; i < argc; i++) { std::string a=argv[i]; auto nx=[&]{return (i+1<argc)?argv[++i]:"";};
         if (a=="--model") model=nx(); else if (a=="--pcm") pcm_npy=nx(); else if (a=="--ref-dir") ref_dir=nx();
-        else if (a=="--audio") audio=nx(); else if (a=="--validate") validate=true; }
+        else if (a=="--audio") audio=nx(); else if (a=="--validate") validate=true; else if (a=="--stream") stream=true; }
 
     // ---- backend (CUDA if present) ----
     ggml_backend_load_all();
@@ -213,6 +367,95 @@ int main(int argc, char ** argv) {
           ggml_backend_tensor_set(g,vg.data(),0,C*sizeof(float));
           ggml_backend_tensor_set(b,vb.data(),0,C*sizeof(float));
       } }
+
+    auto bbt = ggml_backend_get_default_buffer_type(backend);
+    // run the conv stem on a chunk mel [n_mel, Tc] (flat m*Tc+t) -> embeddings [512, Tsub] (flat t*512+d)
+    auto run_stem = [&](const std::vector<float>& mel_chunk, int Tc, int& Tsub_out)->std::vector<float> {
+        size_t mm = ggml_tensor_overhead()*4096 + ggml_graph_overhead_custom(4096,false);
+        ggml_init_params ip{mm,nullptr,true}; ggml_context* c0=ggml_init(ip);
+        ggml_cgraph* g=ggml_new_graph_custom(c0,4096,false);
+        ggml_tensor* in=ggml_new_tensor_4d(c0,GGML_TYPE_F32,Tc,n_mel,1,1); ggml_set_input(in);
+        ggml_tensor* pe=build_stem(c0,W,in); ggml_set_output(pe);
+        ggml_build_forward_expand(g,pe);
+        ggml_gallocr_t a=ggml_gallocr_new(bbt); ggml_gallocr_alloc_graph(a,g);
+        ggml_backend_tensor_set(in,mel_chunk.data(),0,(size_t)Tc*n_mel*sizeof(float));
+        ggml_backend_graph_compute(backend,g);
+        Tsub_out=(int)pe->ne[1];
+        std::vector<float> out((size_t)512*Tsub_out);
+        ggml_backend_tensor_get(pe,out.data(),0,out.size()*sizeof(float));
+        ggml_gallocr_free(a); ggml_free(c0); return out;
+    };
+    // run conformer(17)+proj+transformer(18)+head on embeddings [512,N] -> speaker probs [4,N] (flat t*4+s)
+    auto run_enc_head = [&](const std::vector<float>& embs, int N)->std::vector<float> {
+        size_t mm = ggml_tensor_overhead()*16384 + ggml_graph_overhead_custom(16384,false);
+        ggml_init_params ip{mm,nullptr,true}; ggml_context* c0=ggml_init(ip);
+        ggml_cgraph* g=ggml_new_graph_custom(c0,16384,false);
+        const int Dm=512,nh=8,dh=64,n_tf=18,th=8,tdh=24;
+        ggml_tensor* in=ggml_new_tensor_2d(c0,GGML_TYPE_F32,Dm,N); ggml_set_input(in);
+        ggml_tensor* pos=ggml_new_tensor_2d(c0,GGML_TYPE_F32,Dm,2*N-1); ggml_set_input(pos);
+        ggml_tensor* cur=ggml_scale(c0,in,std::sqrt((float)Dm));
+        for(int il=0;il<n_enc;il++) cur=build_conformer_block(c0,W,il,cur,pos,nh,dh);
+        cur=ggml_add(c0,ggml_mul_mat(c0,W("sm.encproj.w"),cur),W("sm.encproj.b"));
+        for(int il=0;il<n_tf;il++) cur=build_transformer_block(c0,W,il,cur,th,tdh);
+        ggml_tensor* preds=build_speaker_head(c0,W,cur,nullptr); ggml_set_output(preds);
+        ggml_build_forward_expand(g,preds);
+        std::vector<float> peh=make_pos_emb(Dm,N);
+        ggml_gallocr_t a=ggml_gallocr_new(bbt); ggml_gallocr_alloc_graph(a,g);
+        ggml_backend_tensor_set(in,embs.data(),0,embs.size()*sizeof(float));
+        ggml_backend_tensor_set(pos,peh.data(),0,peh.size()*sizeof(float));
+        ggml_backend_graph_compute(backend,g);
+        std::vector<float> out((size_t)4*N);
+        ggml_backend_tensor_get(preds,out.data(),0,out.size()*sizeof(float));
+        ggml_gallocr_free(a); ggml_free(c0); return out;
+    };
+
+    if (stream) {
+        // ===== AOSC streaming: chunk the mel, carry a speaker cache of pre-encode embeddings =====
+        const int sub=8, chunk_sub=188, lc_ctx=1, rc_ctx=1;   // NeMo config (chunk_len 188, ctx +-1)
+        const int feat_len=T, spkcache_max=188;
+        std::vector<float> spkcache;  int spk_T=0;            // [512*spk_T] flat
+        std::vector<float> total_preds; int total_T=0;        // [4*total_T] flat
+        int stt=0, ci=0; bool warned=false;
+        printf("\n=== streaming (chunk_len=%d frames=%.2fs, ctx +-%d) ===\n", chunk_sub, chunk_sub*sub*0.01, lc_ctx);
+        while (stt < feat_len) {
+            int loff=std::min(lc_ctx*sub, stt);
+            int end=std::min(stt+chunk_sub*sub, feat_len);
+            int roff=std::min(rc_ctx*sub, feat_len-end);
+            int a=stt-loff, b=end+roff, Tc=b-a;
+            std::vector<float> cmel((size_t)n_mel*Tc);
+            for(int m=0;m<n_mel;m++) for(int tt=0;tt<Tc;tt++) cmel[(size_t)m*Tc+tt]=mel[(size_t)m*T+(a+tt)];
+            int Tcs=0; std::vector<float> cemb=run_stem(cmel, Tc, Tcs);   // [512,Tcs]
+            int lc=(int)std::lround((double)loff/sub), rc=(int)std::ceil((double)roff/sub);
+            int chunk_len=Tcs-lc-rc;
+            int N=spk_T+Tcs;
+            std::vector<float> concat((size_t)512*N);
+            std::copy(spkcache.begin(), spkcache.end(), concat.begin());
+            std::copy(cemb.begin(), cemb.end(), concat.begin()+(size_t)512*spk_T);
+            std::vector<float> preds=run_enc_head(concat, N);            // [4,N]
+            for(int t=0;t<chunk_len;t++){ int src=spk_T+lc+t; for(int s=0;s<4;s++) total_preds.push_back(preds[(size_t)src*4+s]); }
+            total_T += chunk_len;
+            for(int t=0;t<chunk_len;t++){ int src=lc+t; for(int d=0;d<512;d++) spkcache.push_back(cemb[(size_t)src*512+d]); }
+            spk_T += chunk_len;
+            printf("  chunk %d: mel[%d:%d] -> %d emb, concat=%d (cache=%d), chunk_len=%d\n", ci,a,b,Tcs,N,spk_T-chunk_len,chunk_len);
+            stt=end; ci++;
+            if (spk_T>spkcache_max && stt<feat_len && !warned) {
+                printf("  [warn] speaker cache exceeds %d frames; _compress_spkcache not yet implemented "
+                       "-> results may diverge from NeMo for chunk %d onward (long-form > ~30s)\n", spkcache_max, ci);
+                warned=true;
+            }
+        }
+        emit_diarization(total_preds, total_T, 4);
+        // validate vs NeMo streaming dump if present (reference_streaming sibling of ref_dir)
+        std::string sref = ref_dir; { size_t q=sref.find("reference_offline");
+            if (q!=std::string::npos) sref.replace(q, 17, "reference_streaming"); }
+        try { NpyF32 r=npy_load_f32(sref + "/total_preds.npy");
+            if (r.numel()==(int64_t)total_preds.size()){ double mean=0,mx=max_abs_diff(total_preds.data(),r.data.data(),total_preds.size(),&mean);
+                printf("\nstreaming total_preds vs NeMo: max|diff|=%.3e mean|diff|=%.3e  %s\n",
+                       mx, mean, mean<1e-3?"OK (decisions match NeMo; f32 floor)":"MISMATCH"); }
+        } catch (...) {}
+        gguf_free(gguf); ggml_backend_buffer_free(wbuf); ggml_free(ctxw); ggml_backend_free(backend);
+        return 0;
+    }
 
     // ---- Conformer encoder graph on the backend (stem -> 17 rel-pos blocks -> encoder_proj) ----
     const size_t mem = ggml_tensor_overhead()*16384 + ggml_graph_overhead_custom(16384,false);
