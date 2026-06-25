@@ -362,10 +362,13 @@ int main(int argc, char ** argv) {
     bool stream = false;        // chunked streaming inference (AOSC speaker cache)
     bool mic = false;           // live microphone capture -> streaming diarization
     std::string stream_ref;     // explicit npy to compare streaming total_preds against
+    int cli_chunk = 188, cli_lc = 1, cli_rc = 1;   // streaming chunk len / left / right context (frames)
     for (int i = 1; i < argc; i++) { std::string a=argv[i]; auto nx=[&]{return (i+1<argc)?argv[++i]:"";};
         if (a=="--model") model=nx(); else if (a=="--pcm") pcm_npy=nx(); else if (a=="--ref-dir") ref_dir=nx();
         else if (a=="--audio") audio=nx(); else if (a=="--validate") validate=true; else if (a=="--stream") stream=true;
-        else if (a=="--stream-ref") stream_ref=nx(); else if (a=="--mic") { mic=true; stream=true; } }
+        else if (a=="--stream-ref") stream_ref=nx(); else if (a=="--mic") { mic=true; stream=true; }
+        else if (a=="--chunk-frames") cli_chunk=std::atoi(nx()); else if (a=="--lc") cli_lc=std::atoi(nx());
+        else if (a=="--rc") cli_rc=std::atoi(nx()); }
 
     // ---- backend (CUDA if present) ----
     ggml_backend_load_all();
@@ -491,7 +494,7 @@ int main(int argc, char ** argv) {
 
     if (stream) {
         // ===== AOSC streaming: chunk the mel, carry a speaker cache of pre-encode embeddings =====
-        const int sub=8, chunk_sub=188, lc_ctx=1, rc_ctx=1, spkcache_max=188;  // NeMo config
+        const int sub=8, chunk_sub=cli_chunk, lc_ctx=cli_lc, rc_ctx=cli_rc, spkcache_max=188;  // NeMo: 188/1/1
         const int hop=160; const double FR=0.08;                              // 80ms/output frame
         std::vector<float> spkcache;  int spk_T=0;            // [512*spk_T] pre-encode embeddings
         std::vector<float> spkcache_preds; bool has_preds=false;
