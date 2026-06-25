@@ -46,6 +46,7 @@ add_library(mtmd
             models/step3vl.cpp
             models/siglip.cpp
             models/whisper-enc.cpp
+            models/voxtral-realtime-enc.cpp
             models/deepseekocr.cpp
             models/deepseekocr2.cpp
             models/mobilenetv5.cpp
@@ -121,12 +122,13 @@ add_executable(llama-minicpmv-cli deprecation-warning.cpp)
 add_executable(llama-qwen2vl-cli  deprecation-warning.cpp)
 
 set(TARGET llama-mtmd-cli)
-add_executable         (${TARGET} mtmd-cli.cpp)
+add_executable         (${TARGET} mtmd-cli.cpp mtmd-mic.cpp)
 set_target_properties  (${TARGET} PROPERTIES OUTPUT_NAME llama-mtmd-cli)
 if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET} RUNTIME)
 endif()
 target_link_libraries  (${TARGET} PRIVATE llama-common mtmd Threads::Threads)
+target_include_directories(${TARGET} PRIVATE ../../vendor) # for mtmd-mic.cpp (miniaudio)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
 # mtmd-debug tool

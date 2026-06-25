@@ -78,6 +78,21 @@ struct mtmd_audio_preprocessor_conformer : mtmd_audio_preprocessor {
     mtmd_audio_cache cache;
 };
 
+// Voxtral Realtime audio preprocessor
+// Key differences from Whisper:
+// - Uses center_padding (matching torch.stft center=True)
+// - Applies streaming padding (left/right pad tokens)
+// - Uses fixed GLOBAL_LOG_MEL_MAX = 1.5 for normalization (not data-dependent max)
+// - Outputs a single mel chunk (no 3000-frame splitting)
+struct mtmd_audio_preprocessor_voxtral_rt : mtmd_audio_preprocessor {
+    mtmd_audio_preprocessor_voxtral_rt(const clip_ctx * ctx) : mtmd_audio_preprocessor(ctx) {}
+    void initialize() override;
+    bool preprocess(const float * samples, size_t n_samples, std::vector<mtmd_audio_mel> & output) override;
+
+  private:
+    mtmd_audio_cache cache;
+};
+
 struct mtmd_audio_preprocessor_granite_speech : mtmd_audio_preprocessor {
     mtmd_audio_preprocessor_granite_speech(const clip_ctx * ctx) : mtmd_audio_preprocessor(ctx) {}
     void initialize() override;

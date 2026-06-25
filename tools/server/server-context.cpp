@@ -15,6 +15,8 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "gguf.h"
+#include "ggml.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -24,6 +26,8 @@
 #include <filesystem>
 #include <utility>
 #include <fstream>
+#include <future>
+#include <chrono>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -201,6 +205,30 @@ struct server_slot {
     llama_tokens generated_tokens;
 
     std::vector<completion_token_output> generated_token_probs;
+
+    // word-level timestamps for additive-stream ASR (verbose_json `words`)
+    json asr_words = json::array();
+
+    // additive-stream ASR runtime state — advanced one token per update_slots() call so the
+    // transcription does not block other slots (multi-tenant concurrency).
+    bool                     as_active     = false;
+    // async audio encode: the encoder graph runs on a background thread so it does not block
+    // the inference loop; the slot polls the future each tick until it is ready.
+    std::future<bool>        as_encode_future;
+    const mtmd_input_chunk * as_audio_chunk = nullptr; // borrowed; valid while the task lives
+    bool                     as_encoding   = false;
+    std::vector<float>       as_audio;        // [as_n_audio * as_n_embd_a] encoder embeddings
+    int                      as_n_audio    = 0;
+    int                      as_n_embd     = 0; // text input embedding dim
+    int                      as_n_embd_a   = 0; // audio embedding dim
+    std::vector<llama_token> as_prefix;        // BOS + streaming pad/delay tokens
+    int                      as_pos        = 0; // current audio frame position
+    llama_token              as_prev       = 0; // last generated token
+    llama_pos                as_n_past     = 0;
+    std::string              as_word;           // word being accumulated
+    double                   as_word_start = 0.0;
+    double                   as_last_t     = 0.0;
+    double                   as_emit_t     = -1.0; // audio time of the token currently being emitted
 
     bool has_next_token = true;
     bool has_new_line   = false;
@@ -850,6 +878,56 @@ struct server_metrics {
 // server_context_impl (private implementation)
 //
 
+// Input token embedding table, loaded from the text model GGUF (token_embd.weight),
+// dequantized to f32 on the host. Used by additive-stream audio decoding to sum a
+// per-position audio embedding with the previous token's input embedding. Generic:
+// works for any model that exposes token_embd.weight.
+struct token_embedding_table {
+    std::vector<float> data;
+    int n_embd = 0;
+    int vocab_size = 0;
+
+    bool load_from_gguf(const char * model_path) {
+        struct gguf_init_params gguf_params = { /*.no_alloc =*/ false, /*.ctx =*/ nullptr };
+        struct ggml_init_params ggml_params = { /*.mem_size =*/ 1024ull*1024*1024, /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ false };
+        struct ggml_context * ggml_ctx = ggml_init(ggml_params);
+        gguf_params.ctx = &ggml_ctx;
+
+        struct gguf_context * gguf_ctx = gguf_init_from_file(model_path, gguf_params);
+        if (gguf_ctx == nullptr) { ggml_free(ggml_ctx); return false; }
+
+        struct ggml_tensor * tensor = ggml_get_tensor(ggml_ctx, "token_embd.weight");
+        if (tensor == nullptr) { gguf_free(gguf_ctx); ggml_free(ggml_ctx); return false; }
+
+        n_embd     = (int) tensor->ne[0];
+        vocab_size = (int) tensor->ne[1];
+        data.resize((size_t) n_embd * vocab_size);
+
+        if (tensor->type == GGML_TYPE_F32) {
+            memcpy(data.data(), tensor->data, data.size() * sizeof(float));
+        } else if (tensor->type == GGML_TYPE_F16) {
+            const ggml_fp16_t * src = (const ggml_fp16_t *) tensor->data;
+            for (size_t i = 0; i < data.size(); i++) data[i] = ggml_fp16_to_fp32(src[i]);
+        } else {
+            const auto * tt = ggml_get_type_traits(tensor->type);
+            if (tt == nullptr || tt->to_float == nullptr) { gguf_free(gguf_ctx); ggml_free(ggml_ctx); return false; }
+            for (int row = 0; row < vocab_size; row++) {
+                const void * src = (const char *) tensor->data + (size_t) row * tensor->nb[1];
+                tt->to_float(src, data.data() + (size_t) row * n_embd, n_embd);
+            }
+        }
+
+        gguf_free(gguf_ctx);
+        ggml_free(ggml_ctx);
+        return true;
+    }
+
+    const float * get(int token_id) const {
+        if (token_id < 0 || token_id >= vocab_size) return nullptr;
+        return data.data() + (size_t) token_id * n_embd;
+    }
+};
+
 struct server_context_impl {
     friend struct server_context;
 
@@ -861,6 +939,16 @@ public:
 
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
+
+    // additive-stream audio decoding (causal streaming ASR encoders): the audio
+    // embeddings are added per-position to the text token embedding during decode.
+    bool                          audio_decode_additive = false;
+    struct mtmd_audio_stream_params audio_stream_params  = {};
+    token_embedding_table         tok_embd;
+    // at most one background audio encode runs at a time: the clip context (mctx) is shared
+    // across slots and must not be touched concurrently. The text decoder (llama context)
+    // keeps running on the main thread meanwhile.
+    bool                          as_encode_in_flight   = false;
 
     server_queue    queue_tasks;
     server_response queue_results;
@@ -1266,6 +1354,21 @@ private:
                 return false;
             }
             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+
+            // Detect causal/streaming audio encoders (e.g. dual-stream ASR). Their audio
+            // embeddings form an additive per-position decode stream rather than a prefix,
+            // so they need the input token embedding table to combine the two streams.
+            audio_decode_additive = (mtmd_get_audio_decode_mode(mctx) == MTMD_AUDIO_DECODE_ADDITIVE_STREAM);
+            if (audio_decode_additive) {
+                audio_stream_params = mtmd_get_audio_stream_params(mctx);
+                if (!tok_embd.load_from_gguf(params_base.model.path.c_str())) {
+                    SRV_ERR("%s\n", "failed to load token_embd.weight for additive-stream audio decoding");
+                    return false;
+                }
+                SRV_INF("additive-stream audio decoding enabled (token embeddings: vocab=%d, n_embd=%d, pad=%d, left_pad=%d, delay=%d)\n",
+                        tok_embd.vocab_size, tok_embd.n_embd,
+                        audio_stream_params.pad_token_id, audio_stream_params.n_left_pad, audio_stream_params.n_delay);
+            }
 
             if (params_base.ctx_shift) {
                 params_base.ctx_shift = false;
@@ -2093,6 +2196,7 @@ private:
         res->res_type          = slot.task->params.res_type;
         res->oaicompat_model   = slot.task->params.oaicompat_model;
         res->oaicompat_cmpl_id = slot.task->params.oaicompat_cmpl_id;
+        res->oaicompat_asr_start = slot.as_emit_t; // per-delta audio timestamp (-1 if not ASR)
 
         // populate res.probs_output
         if (slot.task->params.sampling.n_probs > 0) {
@@ -2148,6 +2252,7 @@ private:
         res->res_type          = slot.task->params.res_type;
         res->oaicompat_model   = slot.task->params.oaicompat_model;
         res->oaicompat_cmpl_id = slot.task->params.oaicompat_cmpl_id;
+        res->oaicompat_asr_words = slot.asr_words; // word timestamps (empty unless additive-stream ASR)
 
         // populate res.probs_output
         if (slot.task->params.sampling.n_probs > 0) {
@@ -2744,6 +2849,251 @@ private:
     };
 #endif
 
+    // Generic additive-stream audio decoding (causal streaming ASR encoders).
+    //
+    // The audio encoder produces one embedding per output position; the decoder input
+    // at each position is audio_embd[pos] + input_token_embd[prev_token], advancing one
+    // audio frame per generated token. This runs the whole transcription for the slot
+    // synchronously (encode is now flash-attention fast), emitting tokens through the
+    // normal process_token()/send_partial_response() path so OpenAI transcript.text.delta
+    // / .done SSE is reused unchanged. Keyed off the generic decode mode — no model names.
+    // audio time (seconds) of encoder frame `pos`; the leading n_left_pad frames are silence
+    double as_frame_time(int pos) const {
+        const double t = (double)(pos - audio_stream_params.n_left_pad) * 0.08; // 12.5 Hz frames
+        return t < 0.0 ? 0.0 : t;
+    }
+
+    void as_finalize_word(server_slot & slot, double end_t) {
+        if (!slot.as_word.empty()) {
+            slot.asr_words.push_back(json{
+                {"word",  slot.as_word},
+                {"start", slot.as_word_start},
+                {"end",   end_t},
+            });
+            slot.as_word.clear();
+        }
+    }
+
+    // input embedding for an audio frame = audio_embd[pos] + input_token_embd[tok]
+    void as_combine(const server_slot & slot, float * dst, int pos, llama_token tok) {
+        const float * ae = slot.as_audio.data() + (size_t) pos * slot.as_n_embd_a;
+        const float * te = tok_embd.get(tok);
+        for (int j = 0; j < slot.as_n_embd; j++) dst[j] = ae[j] + (te ? te[j] : 0.0f);
+    }
+
+    // emit one generated token: stream it (process_token -> transcript.text.delta) and
+    // accumulate word-level timestamps. Streaming control markers are fed back but hidden.
+    void as_emit(server_slot & slot, llama_token tok, int pos) {
+        const std::string piece = common_token_to_piece(slot.ctx_tgt, tok, params_base.special);
+        if (piece.find("[STREAMING_PAD]")  != std::string::npos ||
+            piece.find("[STREAMING_WORD]") != std::string::npos) {
+            return;
+        }
+        const double t = as_frame_time(pos);
+        slot.as_last_t = t;
+        slot.as_emit_t = t; // exposed per-delta to the client via oaicompat_asr_start
+        if (!piece.empty()) {
+            if (piece[0] == ' ') {
+                as_finalize_word(slot, t);
+                slot.as_word_start = t;
+                slot.as_word += piece.substr(1);
+            } else {
+                if (slot.as_word.empty()) slot.as_word_start = t;
+                slot.as_word += piece;
+            }
+        }
+        completion_token_output result;
+        result.tok          = tok;
+        result.text_to_send = piece;
+        result.prob         = 1.0f;
+        slot.n_decoded += 1;
+        process_token(result, slot);
+    }
+
+    void as_finish(server_slot & slot) {
+        as_finalize_word(slot, slot.as_last_t + 0.08);
+        if (slot.stop == STOP_TYPE_NONE) {
+            slot.stop = STOP_TYPE_LIMIT; // reached end of audio
+        }
+        slot.as_active = false;
+        send_final_response(slot);
+        slot.release();
+    }
+
+    // Generic additive-stream audio decoding (causal streaming ASR encoders), step 1:
+    // encode the audio, prefill the streaming prefix, and emit the first token. The audio
+    // decoder input at each position is audio_embd[pos] + input_token_embd[prev_token],
+    // advancing one audio frame per generated token. Keyed off the generic decode mode — no
+    // model names. The rest is driven one token per update_slots() call by as_step(), so a
+    // long transcription does not block other slots (multi-tenant concurrency).
+    void as_begin(server_slot & slot) {
+        slot.t_start_generation = ggml_time_us();
+        slot.asr_words = json::array();
+        slot.as_word.clear();
+        slot.as_last_t = 0.0;
+
+        // locate the audio chunk in the request tokens
+        const auto & input_tokens = slot.task->tokens;
+        const mtmd_input_chunk * audio_chunk = nullptr;
+        {
+            size_t cur = 0;
+            while (true) {
+                auto [chunk_ptr, next_idx] = input_tokens.find_next_media_chunk(cur);
+                if (chunk_ptr == nullptr) break;
+                const mtmd_input_chunk * c = chunk_ptr->get();
+                if (mtmd_input_chunk_get_type(c) == MTMD_INPUT_CHUNK_TYPE_AUDIO) { audio_chunk = c; break; }
+                cur = next_idx + 1;
+            }
+        }
+        if (audio_chunk == nullptr) {
+            send_error(*slot.task, "no audio input found in transcription request", ERROR_TYPE_INVALID_REQUEST);
+            slot.release();
+            return;
+        }
+
+        // set up the encode batch (cheap), then run the encoder graph on a background thread
+        // so it does not block the inference loop. Only the clip context is touched on that
+        // thread; the main loop only ever touches the llama (text) context, so the two ggml
+        // backends never run from the same thread. as_step() polls the future each tick.
+        slot.mbatch.reset(mtmd_batch_init(mctx));
+        if (mtmd_batch_add_chunk(slot.mbatch.get(), audio_chunk) != 0) {
+            send_error(*slot.task, "failed to prepare audio batch", ERROR_TYPE_SERVER);
+            slot.release();
+            return;
+        }
+        slot.as_audio_chunk = audio_chunk;
+        mtmd_batch * mb = slot.mbatch.get();
+        slot.as_encode_future = std::async(std::launch::async, [mb]() {
+            return mtmd_batch_encode(mb) == 0;
+        });
+        slot.as_active        = true;
+        slot.as_encoding      = true;
+        as_encode_in_flight   = true;
+    }
+
+    // called once the background encode has finished: copy embeddings, prefill the streaming
+    // prefix, and emit the first token. Returns false if the slot was finished/released here.
+    bool as_after_encode(server_slot & slot) {
+        const float * audio_embd = mtmd_batch_get_output_embd(slot.mbatch.get(), slot.as_audio_chunk);
+        const int n_audio = (int) mtmd_input_chunk_get_n_tokens(slot.as_audio_chunk);
+        if (audio_embd == nullptr || n_audio <= 0) {
+            send_error(*slot.task, "audio produced no embeddings", ERROR_TYPE_SERVER);
+            slot.as_active = false;
+            slot.release();
+            return false;
+        }
+
+        slot.as_n_embd   = llama_model_n_embd(model_tgt);
+        slot.as_n_embd_a = llama_model_n_embd_inp(model_tgt);
+        slot.as_n_audio  = n_audio;
+        slot.as_audio.assign(audio_embd, audio_embd + (size_t) n_audio * slot.as_n_embd_a);
+
+        // streaming prefix: BOS + (n_left_pad + n_delay) pad tokens
+        slot.as_prefix.clear();
+        slot.as_prefix.push_back(llama_vocab_bos(vocab));
+        for (int i = 0; i < audio_stream_params.n_left_pad + audio_stream_params.n_delay; i++) {
+            slot.as_prefix.push_back((llama_token) audio_stream_params.pad_token_id);
+        }
+        const int n_prefix = (int) slot.as_prefix.size();
+        if (n_prefix > n_audio) {
+            send_error(*slot.task, "audio too short for streaming prefix", ERROR_TYPE_INVALID_REQUEST);
+            slot.as_active = false;
+            slot.release();
+            return false;
+        }
+
+        common_sampler_reset(slot.smpl.get());
+        common_context_seq_rm(slot.ctx_tgt, slot.id, -1, -1);
+
+        // prefill the prefix positions (cheap, done in one go)
+        const int n_batch = (int) llama_n_batch(slot.ctx_tgt);
+        llama_pos n_past = 0;
+        for (int off = 0; off < n_prefix; off += n_batch) {
+            const int nb = std::min(n_batch, n_prefix - off);
+            llama_batch batch = llama_batch_init(nb, slot.as_n_embd, 1);
+            batch.n_tokens = nb;
+            for (int i = 0; i < nb; i++) {
+                as_combine(slot, batch.embd + (size_t) i * slot.as_n_embd, off + i, slot.as_prefix[off + i]);
+                batch.pos[i]       = n_past + i;
+                batch.n_seq_id[i]  = 1;
+                batch.seq_id[i][0] = slot.id;
+                batch.logits[i]    = (off + i == n_prefix - 1) ? 1 : 0;
+            }
+            const int rc = llama_decode(slot.ctx_tgt, batch);
+            llama_batch_free(batch);
+            if (rc != 0) {
+                send_error(*slot.task, "decode failed during audio prefill", ERROR_TYPE_SERVER);
+                slot.as_active = false;
+                slot.release();
+                return false;
+            }
+            n_past += nb;
+        }
+        slot.as_n_past = n_past;
+
+        // first token from the prefill logits
+        slot.as_prev = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, -1);
+        common_sampler_accept(slot.smpl.get(), slot.as_prev, true);
+        slot.as_pos  = n_prefix;
+        as_emit(slot, slot.as_prev, n_prefix);
+
+        if (llama_vocab_is_eog(vocab, slot.as_prev) || slot.as_pos >= slot.as_n_audio || !slot.has_next_token) {
+            as_finish(slot);
+            return false;
+        }
+        return true;
+    }
+
+    // one step for an active additive-stream slot: poll the background encode, then (once
+    // ready) decode one token per call.
+    void as_step(server_slot & slot) {
+        if (slot.as_encoding) {
+            // non-blocking poll so other slots keep running while the audio encodes
+            if (slot.as_encode_future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+                return; // still encoding — yield
+            }
+            slot.as_encoding = false;
+            const bool enc_ok = slot.as_encode_future.get();
+            as_encode_in_flight = false; // clip context is free again
+            if (!enc_ok) {
+                send_error(*slot.task, "failed to encode audio", ERROR_TYPE_SERVER);
+                slot.as_active = false;
+                slot.release();
+                return;
+            }
+            as_after_encode(slot); // prefill + first token (handles its own release on finish/error)
+            return;
+        }
+
+        if (!slot.has_next_token || slot.as_pos >= slot.as_n_audio ||
+            llama_vocab_is_eog(vocab, slot.as_prev) || slot.as_n_past + 1 >= slot.n_ctx) {
+            as_finish(slot);
+            return;
+        }
+
+        llama_batch ar = llama_batch_init(1, slot.as_n_embd, 1);
+        as_combine(slot, ar.embd, slot.as_pos, slot.as_prev);
+        ar.n_tokens     = 1;
+        ar.pos[0]       = slot.as_n_past;
+        ar.n_seq_id[0]  = 1;
+        ar.seq_id[0][0] = slot.id;
+        ar.logits[0]    = 1;
+        const int rc = llama_decode(slot.ctx_tgt, ar);
+        llama_batch_free(ar);
+        if (rc != 0) {
+            send_error(*slot.task, "decode failed during audio stream", ERROR_TYPE_SERVER);
+            slot.as_active = false;
+            slot.release();
+            return;
+        }
+        slot.as_n_past += 1;
+
+        slot.as_prev = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, -1);
+        common_sampler_accept(slot.smpl.get(), slot.as_prev, true);
+        as_emit(slot, slot.as_prev, slot.as_pos);
+        slot.as_pos += 1;
+    }
+
     void update_slots() {
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
@@ -3046,6 +3396,31 @@ private:
                 }
 
                 if (!slot.is_processing()) {
+                    return;
+                }
+
+                // Additive-stream audio decoding (causal streaming ASR encoders): the audio
+                // embeddings are fused per-position with the text stream, which does not fit
+                // the batched token-generation loop. Run the whole transcription for this slot
+                // in isolation. Only routed when the request actually carries audio, so text
+                // requests fall through to the normal path.
+                if (audio_decode_additive &&
+                    (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) &&
+                    slot.task->tokens.find_next_media_chunk(0).first != nullptr) {
+                    // Advance this transcription by one token per update_slots() call so it
+                    // interleaves with (does not block) other slots. as_begin() encodes the
+                    // audio + prefills + emits the first token; as_step() does one decode each.
+                    if (!slot.as_active) {
+                        // only one background audio encode at a time (shared clip context)
+                        if (as_encode_in_flight) {
+                            return; // another slot is encoding; try again next tick
+                        }
+                        slot.state = SLOT_STATE_PROCESSING_PROMPT;
+                        slot.t_start_process_prompt = ggml_time_us();
+                        as_begin(slot);
+                    } else {
+                        as_step(slot);
+                    }
                     return;
                 }
 
@@ -4765,6 +5140,35 @@ void server_routes::init_routes() {
         if (!meta->has_mtmd || !meta->chat_params.allow_audio) {
             res->error(format_error_response("The current model does not support audio input.", ERROR_TYPE_NOT_SUPPORTED));
             return res;
+        }
+
+        // Additive-stream ASR (causal streaming audio encoders): chat templating is
+        // irrelevant for transcription, and some ASR GGUFs ship a chat-template *name*
+        // rather than renderable Jinja (which discards the media marker). Feed the audio
+        // directly via a raw media-marker prompt, bypassing the chat template entirely.
+        if (ctx_server.audio_decode_additive) {
+            auto it = req.files.find("file");
+            if (it == req.files.end()) {
+                res->error(format_error_response("No input file found for transcription", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            std::vector<raw_buffer> files_audio;
+            files_audio.push_back(it->second.data);
+
+            const json inp = json::parse(req.body);
+            json body_asr;
+            body_asr["prompt"] = get_media_marker();
+            const std::string stream = json_value(inp, "stream", std::string("false"));
+            body_asr["stream"] = (stream == "true");
+            if (inp.contains("temperature")) {
+                body_asr["temperature"] = std::stof(inp.at("temperature").get<std::string>());
+            }
+            return handle_completions_impl(
+                req,
+                SERVER_TASK_TYPE_COMPLETION,
+                body_asr,
+                files_audio,
+                TASK_RESPONSE_TYPE_OAI_ASR);
         }
 
         std::vector<raw_buffer> files;

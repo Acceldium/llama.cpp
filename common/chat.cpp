@@ -79,12 +79,21 @@ std::string common_chat_msg::render_content(const std::string & delimiter) const
     }
 
     std::string text;
+    bool last_was_media_marker = false;
     for (const auto & part : content_parts) {
         if (part.type == "text") {
-            if (!text.empty()) {
+            if (!text.empty() && !last_was_media_marker) {
                 text += delimiter;
             }
             text += part.text;
+            last_was_media_marker = false;
+        } else if (part.type == "media_marker") {
+            // Include media markers verbatim (no surrounding delimiter) so multimodal
+            // inputs survive built-in (non-Jinja) chat templates such as mistral. Without
+            // this the marker is dropped and mtmd_tokenize fails with a marker/bitmap
+            // count mismatch (ref: audio transcription on Voxtral / Mistral templates).
+            text += part.text;
+            last_was_media_marker = true;
         }
     }
     return text;

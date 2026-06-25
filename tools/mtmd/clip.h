@@ -91,6 +91,10 @@ bool clip_is_llava(const struct clip_ctx * ctx);
 bool clip_has_vision_encoder(const struct clip_ctx * ctx);
 bool clip_has_audio_encoder(const struct clip_ctx * ctx);
 
+// whether the audio encoder is causal/streaming (its embeddings form an additive
+// per-position decode stream rather than a prepended prefix)
+bool clip_audio_is_causal(const struct clip_ctx * ctx);
+
 bool clip_support_batch(const struct clip_ctx * ctx);
 
 int clip_model_n_temporal_merge(const struct clip_ctx * ctx); // TODO @ngxson : remove, refactor this

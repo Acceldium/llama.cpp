@@ -143,6 +143,30 @@ MTMD_API bool mtmd_support_audio(const mtmd_context * ctx);
 // return -1 if audio is not supported
 MTMD_API int mtmd_get_audio_sample_rate(const mtmd_context * ctx);
 
+// how audio embeddings are consumed by the text decoder
+enum mtmd_audio_decode_mode {
+    // audio embeddings are inserted as a contiguous prefix block in the sequence,
+    // then text is generated after them (Ultravox, Gemma, base Voxtral, ...)
+    MTMD_AUDIO_DECODE_PREFIX = 0,
+    // audio embeddings form a per-position stream that is *added* to the text token
+    // embedding at every decode step, advancing one audio frame per generated token
+    // (causal streaming ASR encoders, e.g. dual-stream models)
+    MTMD_AUDIO_DECODE_ADDITIVE_STREAM = 1,
+};
+
+// how the current model's audio encoder feeds the text decoder.
+// returns MTMD_AUDIO_DECODE_PREFIX when there is no audio encoder.
+MTMD_API enum mtmd_audio_decode_mode mtmd_get_audio_decode_mode(const mtmd_context * ctx);
+
+// parameters for MTMD_AUDIO_DECODE_ADDITIVE_STREAM models. Values come from model
+// metadata when present, otherwise from sensible defaults. Meaningless for PREFIX models.
+struct mtmd_audio_stream_params {
+    int32_t pad_token_id; // token used to fill the prefix / delay buffer
+    int32_t n_left_pad;   // number of pad tokens before audio frames start
+    int32_t n_delay;      // transcription delay, in tokens
+};
+MTMD_API struct mtmd_audio_stream_params mtmd_get_audio_stream_params(const mtmd_context * ctx);
+
 // get the current marker string
 MTMD_API const char * mtmd_get_marker(const mtmd_context * ctx);
 

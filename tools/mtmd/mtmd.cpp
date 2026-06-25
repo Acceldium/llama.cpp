@@ -688,6 +688,13 @@ struct mtmd_context {
                     aud_beg = "[BEGIN_AUDIO]";
                     audio_preproc = std::make_unique<mtmd_audio_preprocessor_whisper>(ctx_a);
                 } break;
+            case PROJECTOR_TYPE_VOXTRAL_REALTIME:
+                {
+                    // [BEGIN_AUDIO] ... (embeddings) ...
+                    // note: the dual-stream eval path lives in mtmd-cli (run_voxtral_realtime)
+                    aud_beg = "[BEGIN_AUDIO]";
+                    audio_preproc = std::make_unique<mtmd_audio_preprocessor_voxtral_rt>(ctx_a);
+                } break;
             case PROJECTOR_TYPE_MUSIC_FLAMINGO:
                 {
                     // <sound> ... (embeddings) ...
@@ -1685,6 +1692,32 @@ bool mtmd_support_vision(const mtmd_context * ctx) {
 
 bool mtmd_support_audio(const mtmd_context * ctx) {
     return ctx->ctx_a != nullptr;
+}
+
+enum mtmd_audio_decode_mode mtmd_get_audio_decode_mode(const mtmd_context * ctx) {
+    if (ctx->ctx_a == nullptr) {
+        return MTMD_AUDIO_DECODE_PREFIX;
+    }
+    // Causal streaming audio encoders feed the decoder as an additive per-position
+    // stream. This is the single point that maps an encoder to its decode mode; it is
+    // driven by the encoder's declared capability, not by any caller-visible model name.
+    if (clip_audio_is_causal(ctx->ctx_a)) {
+        return MTMD_AUDIO_DECODE_ADDITIVE_STREAM;
+    }
+    return MTMD_AUDIO_DECODE_PREFIX;
+}
+
+struct mtmd_audio_stream_params mtmd_get_audio_stream_params(const mtmd_context * ctx) {
+    // Defaults match the streaming-ASR convention (32-token left pad + 6-token delay,
+    // pad filled with the streaming-pad token). Model metadata may override these via
+    // the clip hparams when present.
+    // TODO: override from clip hparams / GGUF metadata keys when models start carrying
+    // them (e.g. clip.audio.stream.{pad_token,left_pad,delay}); current GGUFs do not.
+    struct mtmd_audio_stream_params p;
+    p.pad_token_id = 32;
+    p.n_left_pad   = 32;
+    p.n_delay      = 6;
+    return p;
 }
 
 int mtmd_get_audio_sample_rate(const mtmd_context * ctx) {

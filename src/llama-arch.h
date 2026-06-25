@@ -393,6 +393,8 @@ enum llm_tensor {
     LLM_TENSOR_FFN_POST_NORM,
     LLM_TENSOR_FFN_POST_NORM_1,
     LLM_TENSOR_FFN_POST_NORM_2,
+    LLM_TENSOR_FFN_ADA_NORM_DOWN,  // Voxtral Realtime: ada_rms_norm_t_cond down projection
+    LLM_TENSOR_FFN_ADA_NORM_UP,    // Voxtral Realtime: ada_rms_norm_t_cond up projection
     LLM_TENSOR_FFN_PRE_NORM_2,
     LLM_TENSOR_FFN_GATE,
     LLM_TENSOR_FFN_DOWN,

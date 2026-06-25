@@ -373,6 +373,10 @@ struct server_task_result_cmpl_final : server_task_result {
     std::string oai_resp_reasoning_id;
     std::string oai_resp_message_id;
 
+    // word-level timestamps for the transcription API (verbose_json `words`):
+    // array of { "word": str, "start": float seconds, "end": float seconds }
+    json oaicompat_asr_words = json::array();
+
     virtual bool is_stop() override {
         return true; // in stream mode, final responses are considered stop
     }
@@ -445,6 +449,10 @@ struct server_task_result_cmpl_partial : server_task_result {
 
     // for Anthropic API: track if any reasoning content has been generated
     bool anthropic_has_reasoning = false;
+
+    // additive-stream ASR: audio time (seconds) of this delta's token; -1 if not applicable.
+    // lets clients show word-level timestamps live (also returned in the final words[]).
+    double oaicompat_asr_start = -1.0;
 
     virtual bool is_stop() override {
         return false; // in stream mode, partial responses are not considered stop

@@ -745,6 +745,10 @@ json server_task_result_cmpl_final::to_json_oaicompat_asr() {
             {"input_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
         }},
     };
+    // word-level timestamps (verbose_json), populated for additive-stream ASR models
+    if (!oaicompat_asr_words.empty()) {
+        event["words"] = oaicompat_asr_words;
+    }
     return event;
 }
 
@@ -1310,6 +1314,10 @@ json server_task_result_cmpl_partial::to_json_oaicompat_asr() {
         {"type", "transcript.text.delta"},
         {"delta", content},
     };
+    // live per-token audio timestamp (seconds) for additive-stream ASR
+    if (oaicompat_asr_start >= 0.0) {
+        event["start"] = oaicompat_asr_start;
+    }
     return event;
 }
 

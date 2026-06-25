@@ -58,6 +58,11 @@ void llama_model_llama::load_arch_tensors(llama_model_loader &) {
 
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
 
+        // Voxtral Realtime: precomputed adaptive RMSNorm scale
+        // This is optional - only present in Voxtral Realtime models
+        // Contains precomputed (1 + ada_scale) for the default transcription delay
+        layer.ffn_ada_norm_up = create_tensor(tn(LLM_TENSOR_FFN_ADA_NORM_UP, "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+
         if (hparams.rope_scaling_type_train == LLAMA_ROPE_SCALING_TYPE_LONGROPE) {
             layer.rope_long  = create_tensor(tn(LLM_TENSOR_ROPE_FACTORS_LONG,  "weight", i), {n_rot/2}, TENSOR_NOT_REQUIRED | (i != 0 ? TENSOR_DUPLICATED : 0));
             layer.rope_short = create_tensor(tn(LLM_TENSOR_ROPE_FACTORS_SHORT, "weight", i), {n_rot/2}, TENSOR_NOT_REQUIRED | (i != 0 ? TENSOR_DUPLICATED : 0));
@@ -185,6 +190,16 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                     model.layers[il].ffn_norm, NULL,
                     LLM_NORM_RMS, il);
             cb(cur, "ffn_norm", il);
+
+            // Voxtral Realtime: adaptive RMSNorm (ada_rms_norm_t_cond)
+            // Uses precomputed ada_scale per layer (stored as ada_norm_up tensor
+            // which has been precomputed as: scale = 1 + up(GELU(down(t_cond)))
+            // where t_cond is the sinusoidal time embedding for the default delay)
+            if (model.layers[il].ffn_ada_norm_up) {
+                // ffn_ada_norm_up stores the precomputed (1 + ada_scale) vector [n_embd]
+                cur = ggml_mul(ctx0, cur, model.layers[il].ffn_ada_norm_up);
+                cb(cur, "ffn_ada_norm", il);
+            }
 
             cur = build_ffn(cur,
                     model.layers[il].ffn_up,   model.layers[il].ffn_up_b,   model.layers[il].ffn_up_s,
