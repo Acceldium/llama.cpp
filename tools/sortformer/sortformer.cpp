@@ -20,6 +20,28 @@
 #include <fstream>
 #include <stdexcept>
 
+#ifndef NOMINMAX
+#define NOMINMAX            // miniaudio pulls in windows.h; keep std::min/std::max usable
+#endif
+#define WIN32_LEAN_AND_MEAN
+#define MA_NO_ENCODING
+#define MA_NO_GENERATION
+#define MINIAUDIO_IMPLEMENTATION
+#include "miniaudio/miniaudio.h"
+
+// ----------------------------------------------------------------- audio decode -> 16kHz mono f32
+static std::vector<float> load_audio_16k_mono(const std::string & path) {
+    ma_decoder_config cfg = ma_decoder_config_init(ma_format_f32, /*channels*/1, /*rate*/16000);
+    ma_decoder dec;
+    if (ma_decoder_init_file(path.c_str(), &cfg, &dec) != MA_SUCCESS)
+        throw std::runtime_error("cannot decode audio (wav/mp3/flac): " + path);
+    ma_uint64 frames = 0; ma_decoder_get_length_in_pcm_frames(&dec, &frames);
+    std::vector<float> pcm(frames); ma_uint64 read = 0;
+    ma_decoder_read_pcm_frames(&dec, pcm.data(), frames, &read);
+    pcm.resize(read); ma_decoder_uninit(&dec);
+    return pcm;
+}
+
 // ----------------------------------------------------------------- tiny .npy reader (f32)
 struct NpyF32 { std::vector<int64_t> shape; std::vector<float> data;
     int64_t numel() const { int64_t n = 1; for (auto s : shape) n *= s; return n; } };
@@ -108,8 +130,11 @@ int main(int argc, char ** argv) {
     std::string model = "model/sortformer.gguf";
     std::string pcm_npy = "reference/input_pcm.npy";
     std::string ref_dir = "reference_offline";
+    std::string audio;          // wav/mp3/flac; takes precedence over --pcm when set
+    bool validate = false;      // compare against ref_dir npy targets
     for (int i = 1; i < argc; i++) { std::string a=argv[i]; auto nx=[&]{return (i+1<argc)?argv[++i]:"";};
-        if (a=="--model") model=nx(); else if (a=="--pcm") pcm_npy=nx(); else if (a=="--ref-dir") ref_dir=nx(); }
+        if (a=="--model") model=nx(); else if (a=="--pcm") pcm_npy=nx(); else if (a=="--ref-dir") ref_dir=nx();
+        else if (a=="--audio") audio=nx(); else if (a=="--validate") validate=true; }
 
     // ---- backend (CUDA if present) ----
     ggml_backend_load_all();
@@ -148,13 +173,22 @@ int main(int argc, char ** argv) {
     ggml_backend_tensor_get(t_win, win.data(), 0, ggml_nbytes(t_win));
     ggml_backend_tensor_get(t_fb,  fb.data(),  0, ggml_nbytes(t_fb));
 
+    // ---- input audio -> PCM 16kHz mono ----
+    if (audio.empty()) validate = true;     // the .npy path is the bit-exact validation run
+    std::vector<float> pcm_samples;
+    if (!audio.empty()) {
+        pcm_samples = load_audio_16k_mono(audio);
+        printf("decoded %s: %zu samples (%.2fs)\n", audio.c_str(), pcm_samples.size(), pcm_samples.size()/16000.0);
+    } else {
+        NpyF32 p = npy_load_f32(pcm_npy); pcm_samples = std::move(p.data);
+    }
+
     // ---- mel (CPU) ----
-    NpyF32 pcm = npy_load_f32(pcm_npy);
-    NpyF32 mel_ref = npy_load_f32(ref_dir + "/mel.npy");
     int T = 0;
-    std::vector<float> mel = compute_logmel(pcm.data, win.data(), win_length, fb.data(), n_mel, n_freq,
+    std::vector<float> mel = compute_logmel(pcm_samples, win.data(), win_length, fb.data(), n_mel, n_freq,
                                             512, 160, 0.97f, 5.960464477539063e-08f, T);
-    { int Tref=(int)mel_ref.shape.back(); int Tc=std::min(T,Tref); double mx=0;
+    if (validate) { NpyF32 mel_ref = npy_load_f32(ref_dir + "/mel.npy");
+      int Tref=(int)mel_ref.shape.back(); int Tc=std::min(T,Tref); double mx=0;
       for(int m=0;m<n_mel;m++) for(int t=1;t<Tc-1;t++)
           mx=std::max(mx,std::fabs((double)mel[(size_t)m*T+t]-(double)mel_ref.data[(size_t)m*Tref+t]));
       printf("mel: T=%d interior max|diff|=%.3e -> %s\n", T, mx, mx<5e-3?"OK":"MISMATCH"); }
@@ -372,17 +406,18 @@ int main(int argc, char ** argv) {
         printf("%-14s max|diff|=%.3e mean|diff|=%.3e RMS=%.2f rel=%.3f%%  %s\n",
                tag, mx, mean, rms, 100.0*mx/rms, ok ? "OK" : "MISMATCH");
     };
-    printf("\n=== Conformer encoder validation (%d frames) ===\n", Tsub);
-    cmp("pre_encode", pre_encode, ref_dir + "/pre_encode.npy");
-    for (int il = 0; il < n_enc; il++) cmp((std::string("enc_layer_")+std::to_string(il)).c_str(),
-                                           lay_out[il], ref_dir + "/enc_layer_"+std::to_string(il)+".npy");
-    cmp("encoder_proj", proj, ref_dir + "/encoder_proj.npy");
-
-    printf("\n=== Transformer head + speaker head ===\n");
-    for (int il = 0; il < n_tf; il++) cmp((std::string("tf_layer_")+std::to_string(il)).c_str(),
-                                          tf_out[il], ref_dir + "/tf_layer_"+std::to_string(il)+".npy");
-    cmp("spk_logits", spk_logits, ref_dir + "/spk_logits.npy");
-    cmp("preds", preds, ref_dir + "/preds.npy");
+    if (validate) {
+        printf("\n=== Conformer encoder validation (%d frames) ===\n", Tsub);
+        cmp("pre_encode", pre_encode, ref_dir + "/pre_encode.npy");
+        for (int il = 0; il < n_enc; il++) cmp((std::string("enc_layer_")+std::to_string(il)).c_str(),
+                                               lay_out[il], ref_dir + "/enc_layer_"+std::to_string(il)+".npy");
+        cmp("encoder_proj", proj, ref_dir + "/encoder_proj.npy");
+        printf("\n=== Transformer head + speaker head ===\n");
+        for (int il = 0; il < n_tf; il++) cmp((std::string("tf_layer_")+std::to_string(il)).c_str(),
+                                              tf_out[il], ref_dir + "/tf_layer_"+std::to_string(il)+".npy");
+        cmp("spk_logits", spk_logits, ref_dir + "/spk_logits.npy");
+        cmp("preds", preds, ref_dir + "/preds.npy");
+    }
 
     // ---- final diarization decision (threshold 0.5) + per-speaker activity ----
     {
