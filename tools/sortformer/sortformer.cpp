@@ -20,6 +20,8 @@
 #include <fstream>
 #include <stdexcept>
 #include <functional>
+#include <algorithm>
+#include <limits>
 
 #ifndef NOMINMAX
 #define NOMINMAX            // miniaudio pulls in windows.h; keep std::min/std::max usable
@@ -264,6 +266,64 @@ static void emit_diarization(const std::vector<float> & P, int Tt, int S) {
             else if(!on&&st>=0){ printf("SPEAKER audio 1 %.2f %.2f <NA> <NA> spk%d <NA> <NA>\n", st*fr,(t-st)*fr,s); st=-1; } } }
 }
 
+// NeMo _get_silence_profile: update running mean silence embedding from a block of (embs,preds).
+// embs [C,512] flat f*512+d, preds [C,4] flat f*4+s. Silence = sum_s preds < 0.2.
+static void update_silence(std::vector<float> & mean_sil, double & n_sil,
+                           const std::vector<float> & embs, const std::vector<float> & preds, int C) {
+    const int S=4, D=512; const float SIL_THR=0.2f;
+    std::vector<double> sum(D, 0.0); int count=0;
+    for (int f=0; f<C; f++){ float ps=0; for(int s=0;s<S;s++) ps+=preds[(size_t)f*S+s];
+        if (ps < SIL_THR){ count++; for(int d=0;d<D;d++) sum[d]+=embs[(size_t)f*D+d]; } }
+    if (count==0) return;
+    for (int d=0; d<D; d++) mean_sil[d] = (float)((mean_sil[d]*n_sil + sum[d]) / std::max(n_sil+count, 1.0));
+    n_sil += count;
+}
+
+// NeMo _compress_spkcache (eval, batch=1): keep the 188 most important frames of (embs,preds),
+// ordered by speaker then original frame order, with 3 mean-silence slots per speaker. In-place.
+static void compress_spkcache(std::vector<float> & embs, std::vector<float> & preds,
+                              const std::vector<float> & mean_sil) {
+    const int L=188, S=4, D=512, SIL=3, MAXIDX=99999;
+    const int M=(int)(preds.size()/S);
+    const float NEG=-std::numeric_limits<float>::infinity(), POS=std::numeric_limits<float>::infinity();
+    const float P_THR=0.25f; const int MINPOS=22, STRONG=33, WEAK=66;
+    std::vector<float> sc((size_t)M*S);
+    for (int f=0; f<M; f++){ double l1sum=0, lp[4], l1[4];
+        for (int s=0;s<S;s++){ float p=preds[(size_t)f*S+s];
+            lp[s]=std::log(std::max(p,P_THR)); l1[s]=std::log(std::max(1.0f-p,P_THR)); l1sum+=l1[s]; }
+        for (int s=0;s<S;s++) sc[(size_t)f*S+s]=(float)(lp[s]-l1[s]+l1sum-std::log(0.5)); }
+    for (int f=0;f<M;f++) for(int s=0;s<S;s++) if(!(preds[(size_t)f*S+s]>0.5f)) sc[(size_t)f*S+s]=NEG;
+    int poscnt[4]={0,0,0,0};
+    for (int s=0;s<S;s++) for(int f=0;f<M;f++) if(sc[(size_t)f*S+s]>0) poscnt[s]++;
+    for (int f=0;f<M;f++) for(int s=0;s<S;s++){ bool sp=preds[(size_t)f*S+s]>0.5f;
+        if(!(sc[(size_t)f*S+s]>0) && sp && poscnt[s]>=MINPOS) sc[(size_t)f*S+s]=NEG; }
+    for (int f=L; f<M; f++) for(int s=0;s<S;s++) if(sc[(size_t)f*S+s]!=NEG) sc[(size_t)f*S+s]+=0.05f;
+    auto boost=[&](int k, float add){ for(int s=0;s<S;s++){
+        std::vector<int> idx(M); for(int f=0;f<M;f++) idx[f]=f;
+        int kk=std::min(k,M);
+        std::partial_sort(idx.begin(), idx.begin()+kk, idx.end(),
+            [&](int a,int b){ return sc[(size_t)a*S+s] > sc[(size_t)b*S+s]; });
+        for(int j=0;j<kk;j++) if(sc[(size_t)idx[j]*S+s]!=NEG) sc[(size_t)idx[j]*S+s]+=add; } };
+    boost(STRONG, (float)(-2.0*std::log(0.5)));
+    boost(WEAK,   (float)(-1.0*std::log(0.5)));
+    // flatten value(s,f) = s*(M+SIL)+f ; pad frames (f>=M) score +inf ; pick top-L
+    const int Mp=M+SIL;
+    auto scval=[&](long long fi)->float{ int s=(int)(fi/Mp), f=(int)(fi%Mp);
+        return f>=M ? POS : sc[(size_t)f*S+s]; };
+    std::vector<long long> flat((size_t)S*Mp); for(size_t i=0;i<flat.size();i++) flat[i]=(long long)i;
+    std::partial_sort(flat.begin(), flat.begin()+L, flat.end(),
+        [&](long long a,long long b){ return scval(a) > scval(b); });
+    std::vector<long long> sel(flat.begin(), flat.begin()+L);
+    for (auto& v: sel) if(scval(v)==NEG) v=MAXIDX;        // mark invalid (NeMo placeholder)
+    std::sort(sel.begin(), sel.end());                    // speaker-then-frame order
+    std::vector<float> ne((size_t)L*D), np((size_t)L*S);
+    for (int i=0;i<L;i++){ bool dis=(sel[i]==MAXIDX); int f=(int)(sel[i]%Mp);
+        if(f>=M) dis=true; if(dis) f=0;
+        for(int d=0;d<D;d++) ne[(size_t)i*D+d]= dis ? mean_sil[d] : embs[(size_t)f*D+d];
+        for(int s=0;s<S;s++) np[(size_t)i*S+s]= dis ? 0.0f    : preds[(size_t)f*S+s]; }
+    embs=std::move(ne); preds=std::move(np);
+}
+
 // NeMo create_pe: relative sinusoidal PE, positions (N-1)..-(N-1); host buffer [Dm, 2N-1]
 static std::vector<float> make_pos_emb(int Dm, int N) {
     const int n_pos = 2*N - 1;
@@ -286,9 +346,11 @@ int main(int argc, char ** argv) {
     std::string audio;          // wav/mp3/flac; takes precedence over --pcm when set
     bool validate = false;      // compare against ref_dir npy targets
     bool stream = false;        // chunked streaming inference (AOSC speaker cache)
+    std::string stream_ref;     // explicit npy to compare streaming total_preds against
     for (int i = 1; i < argc; i++) { std::string a=argv[i]; auto nx=[&]{return (i+1<argc)?argv[++i]:"";};
         if (a=="--model") model=nx(); else if (a=="--pcm") pcm_npy=nx(); else if (a=="--ref-dir") ref_dir=nx();
-        else if (a=="--audio") audio=nx(); else if (a=="--validate") validate=true; else if (a=="--stream") stream=true; }
+        else if (a=="--audio") audio=nx(); else if (a=="--validate") validate=true; else if (a=="--stream") stream=true;
+        else if (a=="--stream-ref") stream_ref=nx(); }
 
     // ---- backend (CUDA if present) ----
     ggml_backend_load_all();
@@ -328,7 +390,7 @@ int main(int argc, char ** argv) {
     ggml_backend_tensor_get(t_fb,  fb.data(),  0, ggml_nbytes(t_fb));
 
     // ---- input audio -> PCM 16kHz mono ----
-    if (audio.empty()) validate = true;     // the .npy path is the bit-exact validation run
+    if (audio.empty() && !stream) validate = true;   // the offline .npy path is the bit-exact validation run
     std::vector<float> pcm_samples;
     if (!audio.empty()) {
         pcm_samples = load_audio_16k_mono(audio);
@@ -413,10 +475,13 @@ int main(int argc, char ** argv) {
         // ===== AOSC streaming: chunk the mel, carry a speaker cache of pre-encode embeddings =====
         const int sub=8, chunk_sub=188, lc_ctx=1, rc_ctx=1;   // NeMo config (chunk_len 188, ctx +-1)
         const int feat_len=T, spkcache_max=188;
-        std::vector<float> spkcache;  int spk_T=0;            // [512*spk_T] flat
+        std::vector<float> spkcache;  int spk_T=0;            // [512*spk_T] flat (pre-encode embeddings)
+        std::vector<float> spkcache_preds; bool has_preds=false;  // [4*spk_T] once compression starts
+        std::vector<float> mean_sil(512, 0.0f); double n_sil=0;   // running mean silence embedding
         std::vector<float> total_preds; int total_T=0;        // [4*total_T] flat
-        int stt=0, ci=0; bool warned=false;
-        printf("\n=== streaming (chunk_len=%d frames=%.2fs, ctx +-%d) ===\n", chunk_sub, chunk_sub*sub*0.01, lc_ctx);
+        int stt=0, ci=0;
+        printf("\n=== streaming (chunk_len=%d frames=%.2fs, ctx +-%d, AOSC cache=%d) ===\n",
+               chunk_sub, chunk_sub*sub*0.01, lc_ctx, spkcache_max);
         while (stt < feat_len) {
             int loff=std::min(lc_ctx*sub, stt);
             int end=std::min(stt+chunk_sub*sub, feat_len);
@@ -426,29 +491,42 @@ int main(int argc, char ** argv) {
             for(int m=0;m<n_mel;m++) for(int tt=0;tt<Tc;tt++) cmel[(size_t)m*Tc+tt]=mel[(size_t)m*T+(a+tt)];
             int Tcs=0; std::vector<float> cemb=run_stem(cmel, Tc, Tcs);   // [512,Tcs]
             int lc=(int)std::lround((double)loff/sub), rc=(int)std::ceil((double)roff/sub);
-            int chunk_len=Tcs-lc-rc;
-            int N=spk_T+Tcs;
+            int C=Tcs-lc-rc, N=spk_T+Tcs, spk_T_old=spk_T;
             std::vector<float> concat((size_t)512*N);
             std::copy(spkcache.begin(), spkcache.end(), concat.begin());
             std::copy(cemb.begin(), cemb.end(), concat.begin()+(size_t)512*spk_T);
-            std::vector<float> preds=run_enc_head(concat, N);            // [4,N]
-            for(int t=0;t<chunk_len;t++){ int src=spk_T+lc+t; for(int s=0;s<4;s++) total_preds.push_back(preds[(size_t)src*4+s]); }
-            total_T += chunk_len;
-            for(int t=0;t<chunk_len;t++){ int src=lc+t; for(int d=0;d<512;d++) spkcache.push_back(cemb[(size_t)src*512+d]); }
-            spk_T += chunk_len;
-            printf("  chunk %d: mel[%d:%d] -> %d emb, concat=%d (cache=%d), chunk_len=%d\n", ci,a,b,Tcs,N,spk_T-chunk_len,chunk_len);
-            stt=end; ci++;
-            if (spk_T>spkcache_max && stt<feat_len && !warned) {
-                printf("  [warn] speaker cache exceeds %d frames; _compress_spkcache not yet implemented "
-                       "-> results may diverge from NeMo for chunk %d onward (long-form > ~30s)\n", spkcache_max, ci);
-                warned=true;
+            std::vector<float> preds=run_enc_head(concat, N);            // [N,4] flat t*4+s
+            // pop_out = the chunk's used frames (fifo_len=0 so the whole chunk pops to cache)
+            std::vector<float> pop_embs((size_t)C*512), pop_preds((size_t)C*4);
+            for(int t=0;t<C;t++){ int es=lc+t, ps=spk_T_old+lc+t;
+                for(int d=0;d<512;d++) pop_embs[(size_t)t*512+d]=cemb[(size_t)es*512+d];
+                for(int s=0;s<4;s++)   pop_preds[(size_t)t*4+s]=preds[(size_t)ps*4+s]; }
+            for(int t=0;t<C;t++) for(int s=0;s<4;s++) total_preds.push_back(pop_preds[(size_t)t*4+s]);
+            total_T += C;
+            update_silence(mean_sil, n_sil, pop_embs, pop_preds, C);
+            spkcache.insert(spkcache.end(), pop_embs.begin(), pop_embs.end());
+            if (has_preds) spkcache_preds.insert(spkcache_preds.end(), pop_preds.begin(), pop_preds.end());
+            spk_T += C;
+            bool compressed=false;
+            if (spk_T > spkcache_max) {
+                if (!has_preds) {  // first compression: cache preds = concat preds[:spk_T_old] + chunk preds
+                    spkcache_preds.assign(preds.begin(), preds.begin()+(size_t)spk_T_old*4);
+                    spkcache_preds.insert(spkcache_preds.end(), pop_preds.begin(), pop_preds.end());
+                    has_preds=true;
+                }
+                compress_spkcache(spkcache, spkcache_preds, mean_sil);
+                spk_T = spkcache_max; compressed=true;
             }
+            printf("  chunk %d: mel[%d:%d] -> %d emb, concat=%d, chunk_len=%d, cache=%d%s\n",
+                   ci,a,b,Tcs,N,C,spk_T, compressed?" (compressed)":"");
+            stt=end; ci++;
         }
         emit_diarization(total_preds, total_T, 4);
-        // validate vs NeMo streaming dump if present (reference_streaming sibling of ref_dir)
+        // validate vs NeMo streaming dump if present (explicit --stream-ref, else sibling of ref_dir)
         std::string sref = ref_dir; { size_t q=sref.find("reference_offline");
             if (q!=std::string::npos) sref.replace(q, 17, "reference_streaming"); }
-        try { NpyF32 r=npy_load_f32(sref + "/total_preds.npy");
+        sref = stream_ref.empty() ? (sref + "/total_preds.npy") : stream_ref;
+        try { NpyF32 r=npy_load_f32(sref);
             if (r.numel()==(int64_t)total_preds.size()){ double mean=0,mx=max_abs_diff(total_preds.data(),r.data.data(),total_preds.size(),&mean);
                 printf("\nstreaming total_preds vs NeMo: max|diff|=%.3e mean|diff|=%.3e  %s\n",
                        mx, mean, mean<1e-3?"OK (decisions match NeMo; f32 floor)":"MISMATCH"); }
