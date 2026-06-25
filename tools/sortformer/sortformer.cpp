@@ -22,6 +22,11 @@
 #include <functional>
 #include <algorithm>
 #include <limits>
+#include <mutex>
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <iostream>
 
 #ifndef NOMINMAX
 #define NOMINMAX            // miniaudio pulls in windows.h; keep std::min/std::max usable
@@ -43,6 +48,15 @@ static std::vector<float> load_audio_16k_mono(const std::string & path) {
     ma_decoder_read_pcm_frames(&dec, pcm.data(), frames, &read);
     pcm.resize(read); ma_decoder_uninit(&dec);
     return pcm;
+}
+
+// ----------------------------------------------------------------- live mic capture (miniaudio)
+struct MicCap { std::mutex mtx; std::vector<float> buf; };
+static void mic_callback(ma_device* dev, void* out, const void* in, ma_uint32 frames) {
+    (void)out; MicCap* c = (MicCap*)dev->pUserData;
+    const float* fin = (const float*)in;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    c->buf.insert(c->buf.end(), fin, fin + frames);
 }
 
 // ----------------------------------------------------------------- tiny .npy reader (f32)
@@ -346,11 +360,12 @@ int main(int argc, char ** argv) {
     std::string audio;          // wav/mp3/flac; takes precedence over --pcm when set
     bool validate = false;      // compare against ref_dir npy targets
     bool stream = false;        // chunked streaming inference (AOSC speaker cache)
+    bool mic = false;           // live microphone capture -> streaming diarization
     std::string stream_ref;     // explicit npy to compare streaming total_preds against
     for (int i = 1; i < argc; i++) { std::string a=argv[i]; auto nx=[&]{return (i+1<argc)?argv[++i]:"";};
         if (a=="--model") model=nx(); else if (a=="--pcm") pcm_npy=nx(); else if (a=="--ref-dir") ref_dir=nx();
         else if (a=="--audio") audio=nx(); else if (a=="--validate") validate=true; else if (a=="--stream") stream=true;
-        else if (a=="--stream-ref") stream_ref=nx(); }
+        else if (a=="--stream-ref") stream_ref=nx(); else if (a=="--mic") { mic=true; stream=true; } }
 
     // ---- backend (CUDA if present) ----
     ggml_backend_load_all();
@@ -389,28 +404,31 @@ int main(int argc, char ** argv) {
     ggml_backend_tensor_get(t_win, win.data(), 0, ggml_nbytes(t_win));
     ggml_backend_tensor_get(t_fb,  fb.data(),  0, ggml_nbytes(t_fb));
 
-    // ---- input audio -> PCM 16kHz mono ----
+    // ---- input audio -> PCM 16kHz mono (skipped for --mic: captured live below) ----
     if (audio.empty() && !stream) validate = true;   // the offline .npy path is the bit-exact validation run
-    std::vector<float> pcm_samples;
-    if (!audio.empty()) {
-        pcm_samples = load_audio_16k_mono(audio);
-        printf("decoded %s: %zu samples (%.2fs)\n", audio.c_str(), pcm_samples.size(), pcm_samples.size()/16000.0);
-    } else {
-        NpyF32 p = npy_load_f32(pcm_npy); pcm_samples = std::move(p.data);
+    std::vector<float> pcm_samples; int T = 0; std::vector<float> mel;
+    auto logmel = [&](const std::vector<float>& pcm, bool mask_last)->std::pair<std::vector<float>,int>{
+        int Tt=0; std::vector<float> m = compute_logmel(pcm, win.data(), win_length, fb.data(), n_mel, n_freq,
+                                                        512, 160, 0.97f, 5.960464477539063e-08f, Tt);
+        if (mask_last && Tt>0) for(int k=0;k<n_mel;k++) m[(size_t)k*Tt + (Tt-1)]=0.0f;
+        return {m, Tt};
+    };
+    if (!mic) {
+        if (!audio.empty()) {
+            pcm_samples = load_audio_16k_mono(audio);
+            printf("decoded %s: %zu samples (%.2fs)\n", audio.c_str(), pcm_samples.size(), pcm_samples.size()/16000.0);
+        } else {
+            NpyF32 p = npy_load_f32(pcm_npy); pcm_samples = std::move(p.data);
+        }
+        auto mr = logmel(pcm_samples, /*mask_last*/false); mel = std::move(mr.first); T = mr.second;
+        if (validate) { NpyF32 mel_ref = npy_load_f32(ref_dir + "/mel.npy");
+          int Tref=(int)mel_ref.shape.back(); int Tc=std::min(T,Tref); double mx=0;
+          for(int k=0;k<n_mel;k++) for(int t=1;t<Tc-1;t++)
+              mx=std::max(mx,std::fabs((double)mel[(size_t)k*T+t]-(double)mel_ref.data[(size_t)k*Tref+t]));
+          printf("mel: T=%d interior max|diff|=%.3e -> %s\n", T, mx, mx<5e-3?"OK":"MISMATCH"); }
+        // NeMo masks the final out-of-length mel frame to 0 before the encoder.
+        for (int k = 0; k < n_mel; k++) mel[(size_t)k*T + (T-1)] = 0.0f;
     }
-
-    // ---- mel (CPU) ----
-    int T = 0;
-    std::vector<float> mel = compute_logmel(pcm_samples, win.data(), win_length, fb.data(), n_mel, n_freq,
-                                            512, 160, 0.97f, 5.960464477539063e-08f, T);
-    if (validate) { NpyF32 mel_ref = npy_load_f32(ref_dir + "/mel.npy");
-      int Tref=(int)mel_ref.shape.back(); int Tc=std::min(T,Tref); double mx=0;
-      for(int m=0;m<n_mel;m++) for(int t=1;t<Tc-1;t++)
-          mx=std::max(mx,std::fabs((double)mel[(size_t)m*T+t]-(double)mel_ref.data[(size_t)m*Tref+t]));
-      printf("mel: T=%d interior max|diff|=%.3e -> %s\n", T, mx, mx<5e-3?"OK":"MISMATCH"); }
-    // NeMo masks the final out-of-length mel frame to 0 before the encoder; match it so the
-    // conv stem sees identical input (otherwise the bad last frame corrupts the last outputs).
-    for (int m = 0; m < n_mel; m++) mel[(size_t)m*T + (T-1)] = 0.0f;
 
     // ---- fold conv-module batch-norm into bn.w(scale)/bn.b(bias) on host (one-time) ----
     // scale = gamma/sqrt(var+eps), bias = beta - mean*scale ; then BN == x*scale + bias.
@@ -473,56 +491,101 @@ int main(int argc, char ** argv) {
 
     if (stream) {
         // ===== AOSC streaming: chunk the mel, carry a speaker cache of pre-encode embeddings =====
-        const int sub=8, chunk_sub=188, lc_ctx=1, rc_ctx=1;   // NeMo config (chunk_len 188, ctx +-1)
-        const int feat_len=T, spkcache_max=188;
-        std::vector<float> spkcache;  int spk_T=0;            // [512*spk_T] flat (pre-encode embeddings)
-        std::vector<float> spkcache_preds; bool has_preds=false;  // [4*spk_T] once compression starts
-        std::vector<float> mean_sil(512, 0.0f); double n_sil=0;   // running mean silence embedding
+        const int sub=8, chunk_sub=188, lc_ctx=1, rc_ctx=1, spkcache_max=188;  // NeMo config
+        const int hop=160; const double FR=0.08;                              // 80ms/output frame
+        std::vector<float> spkcache;  int spk_T=0;            // [512*spk_T] pre-encode embeddings
+        std::vector<float> spkcache_preds; bool has_preds=false;
+        std::vector<float> mean_sil(512, 0.0f); double n_sil=0;
         std::vector<float> total_preds; int total_T=0;        // [4*total_T] flat
-        int stt=0, ci=0;
-        printf("\n=== streaming (chunk_len=%d frames=%.2fs, ctx +-%d, AOSC cache=%d) ===\n",
-               chunk_sub, chunk_sub*sub*0.01, lc_ctx, spkcache_max);
-        while (stt < feat_len) {
+        int ci=0;
+
+        // process one streaming chunk starting at mel-frame `stt`; updates state; returns end frame
+        auto feed_chunk = [&](const std::vector<float>& fmel, int Tfull, int stt, bool verbose)->int {
             int loff=std::min(lc_ctx*sub, stt);
-            int end=std::min(stt+chunk_sub*sub, feat_len);
-            int roff=std::min(rc_ctx*sub, feat_len-end);
+            int end=std::min(stt+chunk_sub*sub, Tfull);
+            int roff=std::min(rc_ctx*sub, Tfull-end);
             int a=stt-loff, b=end+roff, Tc=b-a;
             std::vector<float> cmel((size_t)n_mel*Tc);
-            for(int m=0;m<n_mel;m++) for(int tt=0;tt<Tc;tt++) cmel[(size_t)m*Tc+tt]=mel[(size_t)m*T+(a+tt)];
-            int Tcs=0; std::vector<float> cemb=run_stem(cmel, Tc, Tcs);   // [512,Tcs]
+            for(int k=0;k<n_mel;k++) for(int tt=0;tt<Tc;tt++) cmel[(size_t)k*Tc+tt]=fmel[(size_t)k*Tfull+(a+tt)];
+            int Tcs=0; std::vector<float> cemb=run_stem(cmel, Tc, Tcs);
             int lc=(int)std::lround((double)loff/sub), rc=(int)std::ceil((double)roff/sub);
             int C=Tcs-lc-rc, N=spk_T+Tcs, spk_T_old=spk_T;
             std::vector<float> concat((size_t)512*N);
             std::copy(spkcache.begin(), spkcache.end(), concat.begin());
             std::copy(cemb.begin(), cemb.end(), concat.begin()+(size_t)512*spk_T);
             std::vector<float> preds=run_enc_head(concat, N);            // [N,4] flat t*4+s
-            // pop_out = the chunk's used frames (fifo_len=0 so the whole chunk pops to cache)
             std::vector<float> pop_embs((size_t)C*512), pop_preds((size_t)C*4);
             for(int t=0;t<C;t++){ int es=lc+t, ps=spk_T_old+lc+t;
                 for(int d=0;d<512;d++) pop_embs[(size_t)t*512+d]=cemb[(size_t)es*512+d];
                 for(int s=0;s<4;s++)   pop_preds[(size_t)t*4+s]=preds[(size_t)ps*4+s]; }
+            int chunk_start=total_T;
             for(int t=0;t<C;t++) for(int s=0;s<4;s++) total_preds.push_back(pop_preds[(size_t)t*4+s]);
             total_T += C;
             update_silence(mean_sil, n_sil, pop_embs, pop_preds, C);
             spkcache.insert(spkcache.end(), pop_embs.begin(), pop_embs.end());
             if (has_preds) spkcache_preds.insert(spkcache_preds.end(), pop_preds.begin(), pop_preds.end());
             spk_T += C;
-            bool compressed=false;
+            bool comp=false;
             if (spk_T > spkcache_max) {
-                if (!has_preds) {  // first compression: cache preds = concat preds[:spk_T_old] + chunk preds
+                if (!has_preds) {   // first compression: cache preds = concat preds[:spk_T_old] + chunk preds
                     spkcache_preds.assign(preds.begin(), preds.begin()+(size_t)spk_T_old*4);
                     spkcache_preds.insert(spkcache_preds.end(), pop_preds.begin(), pop_preds.end());
                     has_preds=true;
                 }
                 compress_spkcache(spkcache, spkcache_preds, mean_sil);
-                spk_T = spkcache_max; compressed=true;
+                spk_T = spkcache_max; comp=true;
             }
-            printf("  chunk %d: mel[%d:%d] -> %d emb, concat=%d, chunk_len=%d, cache=%d%s\n",
-                   ci,a,b,Tcs,N,C,spk_T, compressed?" (compressed)":"");
-            stt=end; ci++;
+            if (verbose) {
+                printf("[%6.2f-%6.2fs] chunk %d:", chunk_start*FR, total_T*FR, ci);
+                bool any=false;
+                for(int s=0;s<4;s++){ int act=0; for(int t=0;t<C;t++) if(pop_preds[(size_t)t*4+s]>0.5f) act++;
+                    if(act>0){ printf(" spk%d(%.0f%%)", s, 100.0*act/C); any=true; } }
+                printf("%s%s\n", any?"":" (silence)", comp?"  [cache compressed]":"");
+            }
+            ci++;
+            return end;
+        };
+
+        if (mic) {
+            // ===== live microphone capture -> streaming diarization =====
+            MicCap cap;
+            ma_device_config dc = ma_device_config_init(ma_device_type_capture);
+            dc.capture.format=ma_format_f32; dc.capture.channels=1; dc.sampleRate=16000;
+            dc.dataCallback=mic_callback; dc.pUserData=&cap;
+            ma_device dev;
+            if (ma_device_init(NULL,&dc,&dev)!=MA_SUCCESS){ fprintf(stderr,"mic init failed\n"); return 1; }
+            ma_device_start(&dev);
+            printf("\n=== LIVE mic diarization (chunk %.2fs latency). Press Enter to stop. ===\n", chunk_sub*sub*0.01);
+            std::atomic<bool> stop{false};
+            std::thread waiter([&]{ std::cin.get(); stop=true; });
+            int stt=0;
+            while (!stop) {
+                std::vector<float> snap; { std::lock_guard<std::mutex> lk(cap.mtx); snap=cap.buf; }
+                int Tav = snap.empty()?0:(int)(1 + snap.size()/hop);
+                if (stt + chunk_sub*sub + rc_ctx*sub <= Tav) {
+                    auto mm = logmel(snap, false);
+                    while (stt + chunk_sub*sub + rc_ctx*sub <= mm.second) stt=feed_chunk(mm.first, mm.second, stt, true);
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            ma_device_stop(&dev); ma_device_uninit(&dev);
+            if (waiter.joinable()) waiter.join();
+            std::vector<float> snap; { std::lock_guard<std::mutex> lk(cap.mtx); snap=cap.buf; }
+            auto mm = logmel(snap, true);                       // finalize: process the tail
+            while (stt < mm.second) stt=feed_chunk(mm.first, mm.second, stt, true);
+            printf("\n--- session diarization ---\n");
+            emit_diarization(total_preds, total_T, 4);
+            gguf_free(gguf); ggml_backend_buffer_free(wbuf); ggml_free(ctxw); ggml_backend_free(backend);
+            return 0;
         }
+
+        // ===== file streaming =====
+        printf("\n=== streaming (chunk_len=%d frames=%.2fs, ctx +-%d, AOSC cache=%d) ===\n",
+               chunk_sub, chunk_sub*sub*0.01, lc_ctx, spkcache_max);
+        int stt=0;
+        while (stt < T) stt=feed_chunk(mel, T, stt, true);
+        printf("\n");
         emit_diarization(total_preds, total_T, 4);
-        // validate vs NeMo streaming dump if present (explicit --stream-ref, else sibling of ref_dir)
         std::string sref = ref_dir; { size_t q=sref.find("reference_offline");
             if (q!=std::string::npos) sref.replace(q, 17, "reference_streaming"); }
         sref = stream_ref.empty() ? (sref + "/total_preds.npy") : stream_ref;
