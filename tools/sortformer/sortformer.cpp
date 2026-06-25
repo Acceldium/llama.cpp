@@ -586,8 +586,11 @@ int main(int argc, char ** argv) {
         printf("\n=== streaming (chunk_len=%d frames=%.2fs, ctx +-%d, AOSC cache=%d) ===\n",
                chunk_sub, chunk_sub*sub*0.01, lc_ctx, spkcache_max);
         int stt=0;
+        auto t0=std::chrono::steady_clock::now();
         while (stt < T) stt=feed_chunk(mel, T, stt, true);
-        printf("\n");
+        double infer_s=std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
+        double audio_s=total_T*FR;
+        printf("\ninference: %.1f ms for %.2fs audio  (%.0fx real-time)\n", infer_s*1e3, audio_s, audio_s/infer_s);
         emit_diarization(total_preds, total_T, 4);
         std::string sref = ref_dir; { size_t q=sref.find("reference_offline");
             if (q!=std::string::npos) sref.replace(q, 17, "reference_streaming"); }
