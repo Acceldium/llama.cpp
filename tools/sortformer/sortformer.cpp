@@ -295,7 +295,51 @@ int main(int argc, char ** argv) {
 
     ggml_tensor * proj = ggml_add(ctx0, ggml_mul_mat(ctx0, W("sm.encproj.w"), cur), W("sm.encproj.b"));
     ggml_set_output(proj);
-    ggml_build_forward_expand(gf, proj);
+
+    // ---- Transformer head: 18 post-LN blocks (8 heads, d=192, inner=768 relu, full attn) ----
+    const int n_tf = 18, tf_head = 8, tf_dh = 192/tf_head;   // d_head = 24
+    cur = proj;   // [192, T]
+    std::vector<ggml_tensor*> tf_out;
+    for (int il = 0; il < n_tf; il++) {
+        char p[40]; auto N = [&](const char* s){ snprintf(p,sizeof p,"tf.%d.%s",il,s); return W(p); };
+        ggml_tensor * x0 = cur;
+        // self-attention (full, non-causal; q/k pre-scaled == scores * 1/sqrt(d_head))
+        ggml_tensor * Q = ggml_add(ctx0, ggml_mul_mat(ctx0, N("attn.q.w"), x0), N("attn.q.b"));
+        ggml_tensor * K = ggml_add(ctx0, ggml_mul_mat(ctx0, N("attn.k.w"), x0), N("attn.k.b"));
+        ggml_tensor * V = ggml_add(ctx0, ggml_mul_mat(ctx0, N("attn.v.w"), x0), N("attn.v.b"));
+        const int Tq = (int)x0->ne[1];
+        Q = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, Q, tf_dh, tf_head, Tq), 0,2,1,3)); // [dh,T,H]
+        K = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, K, tf_dh, tf_head, Tq), 0,2,1,3));
+        V = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, V, tf_dh, tf_head, Tq), 1,2,0,3)); // [T,dh,H]
+        ggml_tensor * sc = ggml_mul_mat(ctx0, K, Q);                       // [Tk,Tq,H]
+        sc = ggml_scale(ctx0, sc, 1.0f/std::sqrt((float)tf_dh));
+        sc = ggml_soft_max(ctx0, sc);
+        ggml_tensor * o = ggml_mul_mat(ctx0, V, sc);                       // [dh,Tq,H]
+        o = ggml_cont_2d(ctx0, ggml_permute(ctx0, o, 0,2,1,3), 192, Tq);   // [192,T]
+        o = ggml_add(ctx0, ggml_mul_mat(ctx0, N("attn.o.w"), o), N("attn.o.b"));
+        // residual -> LN1
+        ggml_tensor * x1 = ggml_norm(ctx0, ggml_add(ctx0, x0, o), 1e-5f);
+        x1 = ggml_add(ctx0, ggml_mul(ctx0, x1, N("ln1.w")), N("ln1.b"));
+        // FFN -> residual -> LN2
+        ggml_tensor * f = ggml_add(ctx0, ggml_mul_mat(ctx0, N("ff.in.w"), x1), N("ff.in.b"));
+        f = ggml_relu(ctx0, f);
+        f = ggml_add(ctx0, ggml_mul_mat(ctx0, N("ff.out.w"), f), N("ff.out.b"));
+        ggml_tensor * x2 = ggml_norm(ctx0, ggml_add(ctx0, x1, f), 1e-5f);
+        x2 = ggml_add(ctx0, ggml_mul(ctx0, x2, N("ln2.w")), N("ln2.b"));
+        cur = x2;
+        ggml_set_output(cur); tf_out.push_back(cur);
+    }
+    ggml_tensor * trans_out = cur;
+
+    // ---- speaker head: relu -> Linear(192,192) -> relu -> Linear(192,4) -> sigmoid ----
+    ggml_tensor * h = ggml_relu(ctx0, trans_out);
+    h = ggml_add(ctx0, ggml_mul_mat(ctx0, W("sm.fh2h.w"), h), W("sm.fh2h.b"));
+    h = ggml_relu(ctx0, h);
+    ggml_tensor * spk_logits = ggml_add(ctx0, ggml_mul_mat(ctx0, W("sm.sh2s.w"), h), W("sm.sh2s.b")); // [4,T]
+    ggml_set_output(spk_logits);
+    ggml_tensor * preds = ggml_sigmoid(ctx0, spk_logits);
+    ggml_set_output(preds);
+    ggml_build_forward_expand(gf, preds);
 
     // ---- build pos_emb host values (NeMo create_pe: positions T-1..-(T-1), sin even / cos odd) ----
     std::vector<float> pe_host((size_t)Dm*n_pos);
@@ -333,6 +377,30 @@ int main(int argc, char ** argv) {
     for (int il = 0; il < n_enc; il++) cmp((std::string("enc_layer_")+std::to_string(il)).c_str(),
                                            lay_out[il], ref_dir + "/enc_layer_"+std::to_string(il)+".npy");
     cmp("encoder_proj", proj, ref_dir + "/encoder_proj.npy");
+
+    printf("\n=== Transformer head + speaker head ===\n");
+    for (int il = 0; il < n_tf; il++) cmp((std::string("tf_layer_")+std::to_string(il)).c_str(),
+                                          tf_out[il], ref_dir + "/tf_layer_"+std::to_string(il)+".npy");
+    cmp("spk_logits", spk_logits, ref_dir + "/spk_logits.npy");
+    cmp("preds", preds, ref_dir + "/preds.npy");
+
+    // ---- final diarization decision (threshold 0.5) + per-speaker activity ----
+    {
+        std::vector<float> P((size_t)preds->ne[0]*preds->ne[1]);
+        ggml_backend_tensor_get(preds, P.data(), 0, P.size()*sizeof(float));
+        const int S=(int)preds->ne[0], Tt=(int)preds->ne[1];
+        printf("\nspeaker activity (frames>0.5 of %d, mean prob):\n", Tt);
+        for (int s=0;s<S;s++){ int act=0; double mp=0; for(int t=0;t<Tt;t++){ float v=P[(size_t)t*S+s]; if(v>0.5f)act++; mp+=v; }
+            printf("  spk %d: %4d frames active (%.1f%%), mean=%.4f\n", s, act, 100.0*act/Tt, mp/Tt); }
+        // RTTM segments (80ms/frame = 8x subsampling of 10ms hop), threshold 0.5
+        const double fr = 0.08; const float thr = 0.5f;
+        printf("\nRTTM:\n");
+        for (int s=0;s<S;s++){ int st=-1;
+            for (int t=0;t<=Tt;t++){ bool on = (t<Tt) && P[(size_t)t*S+s]>thr;
+                if (on && st<0) st=t;
+                else if (!on && st>=0){ printf("SPEAKER audio 1 %.2f %.2f <NA> <NA> spk%d <NA> <NA>\n",
+                                               st*fr, (t-st)*fr, s); st=-1; } } }
+    }
 
     ggml_gallocr_free(alloc); ggml_free(ctx0);
     gguf_free(gguf); ggml_backend_buffer_free(wbuf); ggml_free(ctxw); ggml_backend_free(backend);
