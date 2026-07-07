@@ -11,6 +11,7 @@
 #include <set>
 
 struct server_context_impl; // private implementation
+struct qwen3_tts_ctx;       // forward declaration (defined in tools/tts/qwen3tts-lib.h)
 
 struct server_context_meta {
     std::string build_info;
@@ -116,6 +117,7 @@ struct server_res_generator;
 
 struct server_routes {
     server_routes(const common_params & params, server_context & ctx_server);
+    ~server_routes(); // defined in server-context.cpp (qwen3_tts_ctx must be complete there)
 
     void init_routes();
 
@@ -141,6 +143,8 @@ struct server_routes {
     server_http_context::handler_t post_responses_oai;
     server_http_context::handler_t post_responses_tok_oai;
     server_http_context::handler_t post_transcriptions_oai;
+    server_http_context::handler_t post_speech_oai;
+    server_http_context::handler_t post_speaker_embedding;
     server_http_context::handler_t post_anthropic_messages;
     server_http_context::handler_t post_anthropic_count_tokens;
     server_http_context::handler_t post_apply_template;
@@ -174,6 +178,9 @@ private:
 
     const common_params & params;
     const server_context_impl & ctx_server;
+
+    // Qwen3-TTS persistent context (null if not configured)
+    std::unique_ptr<qwen3_tts_ctx> tts_ctx;
 
     server_queue & queue_tasks;
     server_response & queue_results;

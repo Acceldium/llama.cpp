@@ -17,12 +17,16 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+// Qwen3-TTS library (for /v1/audio/speech with Qwen3-TTS models)
+#include "qwen3tts-lib.h"
+
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <queue>
 #include <utility>
 #include <fstream>
 
@@ -4332,8 +4336,24 @@ server_routes::server_routes(const common_params & params, server_context & ctx_
           ctx_server(*ctx_server.impl),
           queue_tasks(ctx_server.impl->queue_tasks),
           queue_results(ctx_server.impl->queue_results) {
+
+    // Initialize Qwen3-TTS context if the necessary model paths are provided
+    const auto & m = params.model;
+    const auto & v = params.vocoder;
+    if (!m.path.empty() && !v.model_cp.path.empty()) {
+        tts_ctx = std::make_unique<qwen3_tts_ctx>();
+        if (!tts_ctx->load(m.path, v.model_cp.path, v.model.path, params.n_gpu_layers)) {
+            fprintf(stderr, "WARN: failed to initialize Qwen3-TTS context; /v1/audio/speech will be unavailable\n");
+            tts_ctx.reset();
+        } else {
+            fprintf(stderr, "INFO: Qwen3-TTS context ready (/v1/audio/speech enabled)\n");
+        }
+    }
+
     init_routes();
 }
+
+server_routes::~server_routes() = default;
 
 void server_routes::init_routes() {
     // IMPORTANT: all lambda functions must start with create_response()
@@ -4803,6 +4823,170 @@ void server_routes::init_routes() {
             body_parsed,
             files,
             TASK_RESPONSE_TYPE_OAI_ASR);
+    };
+
+    this->post_speech_oai = [this](const server_http_req & req) -> server_http_res_ptr {
+        // OpenAI-compatible /v1/audio/speech endpoint (streaming WAV via chunked HTTP).
+        // Requires the server to be started with:
+        //   --model <talker.gguf> --model-cp <cp.gguf> --model-vocoder <vocoder.gguf>
+
+        auto err_res = [](int status, const std::string & msg) -> server_http_res_ptr {
+            auto r = std::make_unique<server_http_res>();
+            r->status = status;
+            r->content_type = "application/json; charset=utf-8";
+            r->data = "{\"error\":{\"message\":\"" + msg + "\"}}";
+            return r;
+        };
+
+        if (!tts_ctx || !tts_ctx->is_loaded()) {
+            return err_res(503, "TTS models not loaded. Start the server with --model <talker.gguf> --model-cp <cp.gguf> --model-vocoder <vocoder.gguf>");
+        }
+
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const json::exception & e) {
+            return err_res(400, std::string("Invalid JSON: ") + e.what());
+        }
+
+        const std::string input    = body.value("input", "");
+        const std::string voice    = body.value("voice", "default");
+        const std::string language = body.value("language", "english");
+        const float       speed    = body.value("speed", 1.0f); // unused for now
+        (void)speed;
+
+        if (input.empty()) {
+            return err_res(400, "Field 'input' is required and must be non-empty");
+        }
+
+        qwen3_tts_request tts_req;
+        tts_req.text     = input;
+        tts_req.language = language;
+
+        if (voice != "default" && voice != "alloy" && voice != "echo" && voice != "fable" &&
+            voice != "onyx"  && voice != "nova"  && voice != "shimmer") {
+            tts_req.ref_audio_path = voice;
+        }
+
+        SRV_DBG("TTS request: text='%s' language='%s' voice='%s'\n",
+                input.c_str(), language.c_str(), voice.c_str());
+
+        // ── Streaming response ────────────────────────────────────────────────
+        // Use chunked transfer encoding so the client starts receiving audio
+        // while generation is still in progress.  The WAV header is sent first
+        // with an "infinite" data-chunk size (0x7FFFFFFF); the client reads until
+        // the connection closes.
+
+        struct TtsStreamState {
+            std::mutex               mtx;
+            std::condition_variable  cv;
+            std::queue<std::string>  pcm_chunks; // raw s16-le bytes
+            bool                     header_sent = false;
+            bool                     done        = false;
+            bool                     error       = false;
+            std::thread              gen_thread;
+
+            ~TtsStreamState() {
+                if (gen_thread.joinable()) gen_thread.join();
+            }
+        };
+
+        auto state = std::make_shared<TtsStreamState>();
+
+        // Launch generation; generate_streaming() handles the class mutex.
+        state->gen_thread = std::thread([this, tts_req, state]() {
+            bool ok = tts_ctx->generate_streaming(
+                tts_req,
+                [state](std::vector<float> chunk) -> bool {
+                    auto s16 = qwen3_tts_pcm_to_s16_bytes(chunk);
+                    std::string bytes(reinterpret_cast<const char *>(s16.data()), s16.size());
+                    {
+                        std::lock_guard<std::mutex> lk(state->mtx);
+                        state->pcm_chunks.push(std::move(bytes));
+                        state->cv.notify_one();
+                    }
+                    return true; // always continue
+                }
+            );
+            {
+                std::lock_guard<std::mutex> lk(state->mtx);
+                state->done  = true;
+                state->error = !ok;
+                state->cv.notify_one();
+            }
+        });
+
+        auto res       = std::make_unique<server_http_res>();
+        res->status    = 200;
+        res->content_type = "audio/wav";
+
+        // Set next to enable chunked streaming via set_chunked_content_provider.
+        res->next = [state](std::string & out_chunk) mutable -> bool {
+            // Send streaming WAV header once as the very first chunk.
+            if (!state->header_sent) {
+                state->header_sent = true;
+                auto hdr = qwen3_tts_streaming_wav_header(24000);
+                out_chunk = std::string(reinterpret_cast<const char *>(hdr.data()), hdr.size());
+                return true;
+            }
+
+            // Wait for the next PCM chunk or for generation to finish.
+            std::unique_lock<std::mutex> lk(state->mtx);
+            state->cv.wait(lk, [&] {
+                return !state->pcm_chunks.empty() || state->done;
+            });
+
+            if (!state->pcm_chunks.empty()) {
+                out_chunk = std::move(state->pcm_chunks.front());
+                state->pcm_chunks.pop();
+                return true;
+            }
+
+            // done == true, queue empty: end of stream.
+            return false;
+        };
+
+        return res;
+    };
+
+    this->post_speaker_embedding = [this](const server_http_req & req) -> server_http_res_ptr {
+        // Extract a 1024-dim speaker embedding (x-vector) from an uploaded WAV file.
+        // Requires the server to be started with --model <talker.gguf> --model-cp <cp.gguf>
+        // (same models as /v1/audio/speech; only the talker's speaker encoder is used).
+
+        auto err_res = [](int status, const std::string & msg) -> server_http_res_ptr {
+            auto r = std::make_unique<server_http_res>();
+            r->status = status;
+            r->content_type = "application/json; charset=utf-8";
+            r->data = "{\"error\":{\"message\":\"" + msg + "\"}}";
+            return r;
+        };
+
+        if (!tts_ctx || !tts_ctx->is_loaded()) {
+            return err_res(503, "TTS models not loaded. Start the server with --model <talker.gguf> --model-cp <cp.gguf>");
+        }
+
+        auto it = req.files.find("file");
+        if (it == req.files.end()) {
+            return err_res(400, "No audio file found under form field 'file'");
+        }
+
+        std::vector<float> samples;
+        if (!qwen3_tts_read_wav_from_memory(it->second.data.data(), it->second.data.size(), samples)) {
+            return err_res(400, "Failed to parse WAV audio (expected 24kHz mono 16-bit PCM)");
+        }
+
+        std::vector<float> embedding;
+        if (!tts_ctx->extract_speaker_embedding(samples, embedding)) {
+            return err_res(500, "Speaker embedding extraction failed (no speaker encoder weights?)");
+        }
+
+        json result = { {"embedding", embedding}, {"dim", (int)embedding.size()} };
+        auto res = std::make_unique<server_http_res>();
+        res->status = 200;
+        res->content_type = "application/json; charset=utf-8";
+        res->data = result.dump();
+        return res;
     };
 
     this->post_anthropic_messages = [this](const server_http_req & req) {

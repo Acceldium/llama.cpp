@@ -219,6 +219,10 @@ int llama_server(int argc, char ** argv) {
     ctx_http.post("/responses",                ex_wrapper(routes.post_responses_oai));
     ctx_http.post("/v1/audio/transcriptions",  ex_wrapper(routes.post_transcriptions_oai));
     ctx_http.post("/audio/transcriptions",     ex_wrapper(routes.post_transcriptions_oai));
+    ctx_http.post("/v1/audio/speech",          ex_wrapper(routes.post_speech_oai));
+    ctx_http.post("/audio/speech",             ex_wrapper(routes.post_speech_oai));
+    ctx_http.post("/v1/audio/speaker-embedding", ex_wrapper(routes.post_speaker_embedding));
+    ctx_http.post("/audio/speaker-embedding",    ex_wrapper(routes.post_speaker_embedding));
     ctx_http.post("/v1/messages",              ex_wrapper(routes.post_anthropic_messages)); // anthropic messages API
     ctx_http.post("/infill",                   ex_wrapper(routes.post_infill));
     ctx_http.post("/embedding",                ex_wrapper(routes.post_embeddings)); // legacy

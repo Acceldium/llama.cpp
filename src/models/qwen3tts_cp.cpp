@@ -17,7 +17,20 @@ void llama_model_qwen3tts_cp::load_arch_tensors(llama_model_loader & ml) {
     const int64_t n_cp_vocab = n_cp_vocab_u32 > 0 ? n_cp_vocab_u32 : 2048;
     GGML_UNUSED(n_cp_vocab);
 
-    tts_cp_small_to_mtp = create_tensor(tn(LLM_TENSOR_TTS_CP_SMALL_TO_MTP, "weight"), {n_embd, n_embd}, TENSOR_NOT_REQUIRED);
+    // small_to_mtp bridges the Talker's hidden size down to the CP's own hidden
+    // size when they differ (e.g. 1.7B: Talker=2048, CP=1024 - CP stays "small"
+    // regardless of Talker size). Not read by the inference tool (which accesses
+    // CP tensors directly via its own GGUF loader, like the per-codebook tensors
+    // below), but must be declared with its real on-disk shape or model loading
+    // fails strict shape validation.
+    int64_t small_to_mtp_in = n_embd;
+    if (const ggml_tensor * meta = ml.get_tensor_meta(tn(LLM_TENSOR_TTS_CP_SMALL_TO_MTP, "weight").str().c_str())) {
+        small_to_mtp_in = meta->ne[0];
+    }
+    tts_cp_small_to_mtp = create_tensor(tn(LLM_TENSOR_TTS_CP_SMALL_TO_MTP, "weight"), {small_to_mtp_in, n_embd}, TENSOR_NOT_REQUIRED);
+    // Only present when small_to_mtp is a real projection (Talker/CP hidden sizes
+    // differ, e.g. 1.7B); absent when it's the identity case (e.g. 0.6B).
+    tts_cp_small_to_mtp_b = create_tensor(tn(LLM_TENSOR_TTS_CP_SMALL_TO_MTP, "bias"), {n_embd}, TENSOR_NOT_REQUIRED);
 
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
 

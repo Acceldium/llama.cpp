@@ -393,6 +393,7 @@ struct common_params_speculative {
 
 struct common_params_vocoder {
     struct common_params_model model;
+    struct common_params_model model_cp; // Code Predictor GGUF (Qwen3-TTS only)
 
     std::string speaker_file; // speaker file path
 

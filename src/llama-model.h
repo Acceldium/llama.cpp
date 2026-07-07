@@ -574,7 +574,8 @@ struct llama_model {
     struct ggml_tensor * tts_codec_head     = nullptr;
 
     // qwen3 tts code predictor
-    struct ggml_tensor * tts_cp_small_to_mtp = nullptr;
+    struct ggml_tensor * tts_cp_small_to_mtp   = nullptr;
+    struct ggml_tensor * tts_cp_small_to_mtp_b = nullptr;
     std::vector<struct ggml_tensor *> tts_cp_codec_embd;
     std::vector<struct ggml_tensor *> tts_cp_lm_head;
 

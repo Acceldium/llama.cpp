@@ -306,6 +306,12 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_DENSE_3_FEAT_IN,        "%s.dense_3_feat_in"  },
     { LLM_KV_DENSE_3_FEAT_OUT,       "%s.dense_3_feat_out" },
 
+    // qwen3 tts
+    { LLM_KV_TTS_TEXT_VOCAB_SIZE,         "%s.tts.text_vocab_size"         },
+    { LLM_KV_TTS_TEXT_EMBEDDING_LENGTH,   "%s.tts.text_embedding_length"   },
+    { LLM_KV_TTS_NUM_CODE_GROUPS,         "%s.tts.num_code_groups"         },
+    { LLM_KV_TTS_POSITION_ID_PER_SECONDS, "%s.tts.position_id_per_seconds" },
+
     { LLM_KV_TOKENIZER_MODEL,                    "tokenizer.ggml.model"                    },
     { LLM_KV_TOKENIZER_PRE,                      "tokenizer.ggml.pre"                      },
     { LLM_KV_TOKENIZER_LIST,                     "tokenizer.ggml.tokens"                   },
@@ -809,6 +815,16 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     // eagle3
     {LLM_TENSOR_FC,                         {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_D2T,                        {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
+    // qwen3 tts
+    {LLM_TENSOR_TTS_TEXT_EMBD,              {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
+    {LLM_TENSOR_TTS_TEXT_PROJ_UP,           {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_TTS_TEXT_PROJ_GATE,         {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_TTS_TEXT_PROJ_DOWN,         {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_TTS_CODEC_EMBD,             {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
+    {LLM_TENSOR_TTS_CODEC_HEAD,             {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_TTS_CP_CODEC_EMBD,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
+    {LLM_TENSOR_TTS_CP_LM_HEAD,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_TTS_CP_SMALL_TO_MTP,       {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL_MAT}},
 };
 
 LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}

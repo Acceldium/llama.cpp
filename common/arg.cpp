@@ -3936,6 +3936,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.vocoder.model.path = value;
         }
     ).set_examples({LLAMA_EXAMPLE_TTS, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"-mcp", "--model-cp"}, "FNAME",
+        "code predictor model for Qwen3-TTS (default: unused)",
+        [](common_params & params, const std::string & value) {
+            params.vocoder.model_cp.path = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
      add_opt(common_arg(
         {"--tts-use-guide-tokens"},
         "Use guide tokens to improve TTS word recall",
