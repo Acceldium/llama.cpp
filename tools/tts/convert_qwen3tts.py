@@ -21,7 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from convert_hf_to_gguf import Qwen3TTSTalkerModel, Qwen3TTSCodePredictorModel, ModelBase
+from conversion.qwen3tts import Qwen3TTSTalkerModel, Qwen3TTSCodePredictorModel
 import gguf
 
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Iterable, TYPE_CHECKING
+from typing import Callable, Iterable, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -38,6 +38,16 @@ class Qwen3TTSTalkerModel(TextModel):
         super().__init__(dir_model, *args, hparams=hparams, **kwargs)
         self.talker_hparams = talker_cfg
         self.block_count = talker_cfg.get("num_hidden_layers", 28)
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        # TextModel.filter_tensors() drops any tensor whose name contains "talker."
+        # as a generic guard against bundled TTS output heads inside otherwise
+        # text-only multimodal chat models. Every tensor in a Qwen3-TTS checkpoint
+        # is legitimately prefixed "talker." (it *is* the talker model), so that
+        # guard would silently filter out 100% of tensors here. Bypass it and go
+        # straight to ModelBase's generic filtering.
+        return ModelBase.filter_tensors(item)
 
     def set_vocab(self):
         try:
@@ -125,6 +135,21 @@ class Qwen3TTSTalkerModel(TextModel):
         if codec_lang:
             self.gguf_writer.add_uint32(f"{self.gguf_writer.arch}.codec.lang.english", codec_lang.get("english", 2050))
 
+        # CustomVoice named speaker presets: spk_id maps a name to a reserved index in
+        # the *existing* codec_embedding table (tts.codec_embd.weight) - not a separate
+        # tensor. Base checkpoints have this empty/None; CustomVoice checkpoints populate
+        # it with ~9 names. spk_is_dialect optionally overrides the codec language id for
+        # a speaker regardless of --language (e.g. "eric" always speaks Sichuan dialect).
+        spk_id = cfg.get("spk_id") or {}
+        if spk_id:
+            spk_is_dialect = cfg.get("spk_is_dialect") or {}
+            names = sorted(spk_id.keys())
+            ids = [spk_id[n] for n in names]
+            dialects = [spk_is_dialect.get(n) or "" for n in names]
+            self.gguf_writer.add_array(f"{self.gguf_writer.arch}.spk_id.names", names)
+            self.gguf_writer.add_array(f"{self.gguf_writer.arch}.spk_id.ids", ids)
+            self.gguf_writer.add_array(f"{self.gguf_writer.arch}.spk_id.dialects", dialects)
+
         # M-RoPE section array
         self.gguf_writer.add_array(f"{self.gguf_writer.arch}.rope.mrope_section",
                                    mrope_section[:3])
@@ -160,6 +185,22 @@ class Qwen3TTSTalkerModel(TextModel):
             return
 
         yield from super().modify_tensors(data_torch, name, bid)
+
+    def tensor_force_quant(self, name, new_name, bid, n_dims):
+        # tools/tts/qwen3tts-lib.cpp reads these tensors with CPU-side row-stride
+        # arithmetic (read_row/read_bias) outside the ggml graph, which only
+        # understands F32/F16/BF16 layouts. Q8_0's block layout breaks that
+        # arithmetic (out-of-bounds reads -> segfault), so keep them
+        # un-quantized regardless of --outtype.
+        if self.ftype == gguf.LlamaFileType.MOSTLY_Q8_0 and new_name in (
+            "tts.text_embd.weight",
+            "tts.text_proj_up.weight",
+            "tts.text_proj_down.weight",
+            "tts.codec_embd.weight",
+            "tts.codec_head.weight",
+        ):
+            return gguf.GGMLQuantizationType.F16
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
 
     @staticmethod
     def _remap_speaker_encoder(name: str) -> str | None:
@@ -236,6 +277,13 @@ class Qwen3TTSCodePredictorModel(TextModel):
         self.talker_hparams = talker_cfg
         self.block_count = cp_cfg.get("num_hidden_layers", 5)
 
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        # See Qwen3TTSTalkerModel.filter_tensors: bypass TextModel's blanket
+        # "talker." exclusion, which would otherwise drop every tensor here too
+        # (they're all under "talker.code_predictor.").
+        return ModelBase.filter_tensors(item)
+
     def set_vocab(self):
         self.gguf_writer.add_tokenizer_model("no_vocab")
 
@@ -305,3 +353,16 @@ class Qwen3TTSCodePredictorModel(TextModel):
             return
 
         yield from super().modify_tensors(data_torch, name, bid)
+
+    def tensor_force_quant(self, name, new_name, bid, n_dims):
+        # Same constraint as Qwen3TTSTalkerModel.tensor_force_quant: these
+        # per-codebook tensors (and, at 1.7B, small_to_mtp) are read via
+        # CPU-side read_row()/read_bias() in tools/tts/qwen3tts-lib.cpp,
+        # which requires F32/F16/BF16 layout.
+        if self.ftype == gguf.LlamaFileType.MOSTLY_Q8_0 and (
+            new_name.startswith("tts.cp.lm_head.")
+            or new_name.startswith("tts.cp.codec_embd.")
+            or new_name == "tts.cp.small_to_mtp.weight"
+        ):
+            return gguf.GGMLQuantizationType.F16
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
