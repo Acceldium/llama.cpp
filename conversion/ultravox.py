@@ -190,6 +190,78 @@ class VoxtralWhisperEncoderModel(WhisperEncoderModel):
         self.gguf_writer.add_audio_stack_factor(4) # == intermediate_size // hidden_size
 
 
+@ModelBase.register("VoxtralRealtimeForConditionalGeneration")
+class VoxtralRealtimeEncoderModel(MmprojModel):
+    """Audio encoder converter for Voxtral Realtime 4B.
+
+    Unlike VoxtralWhisperEncoderModel above, this is not Whisper-shaped and does not
+    subclass WhisperEncoderModel: it's a causal transformer encoder with sliding-window
+    attention, RoPE, SwiGLU, and RMSNorm (see tools/mtmd/models/voxtral-realtime-enc.cpp
+    for the ggml side). Only available in Mistral's native consolidated format.
+    """
+    has_vision_encoder = False
+    has_audio_encoder = True
+    is_mistral_format = True
+
+    def get_audio_config(self) -> dict[str, Any] | None:
+        # audio encoder hparams live under multimodal.whisper_model_args.encoder_args;
+        # remap to the HF-style keys MmprojModel.set_gguf_parameters()/find_aparam() expect
+        encoder_args = self.global_config.get("multimodal", {}) \
+            .get("whisper_model_args", {}).get("encoder_args", {})
+        if not encoder_args:
+            return None
+        audio_encoding = encoder_args.get("audio_encoding_args", {})
+        return {
+            "hidden_size": encoder_args.get("dim", 1280),
+            "intermediate_size": encoder_args.get("hidden_dim", 5120),
+            "num_hidden_layers": encoder_args.get("n_layers", 32),
+            "num_attention_heads": encoder_args.get("n_heads", 32),
+            "num_mel_bins": audio_encoding.get("num_mel_bins", 128),
+            "layer_norm_eps": encoder_args.get("norm_eps", 1e-5),
+        }
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.VOXTRAL_REALTIME)
+        downsample_args = self.global_config.get("multimodal", {}) \
+            .get("whisper_model_args", {}).get("downsample_args", {})
+        self.gguf_writer.add_audio_stack_factor(downsample_args.get("downsample_factor", 4))
+        assert self.hparams_audio is not None
+        self.gguf_writer.add_audio_num_mel_bins(self.hparams_audio["num_mel_bins"])
+        self.gguf_writer.add_audio_attention_layernorm_eps(self.hparams_audio["layer_norm_eps"])
+
+    def tensor_force_quant(self, name, new_name, bid, n_dims):
+        if ".conv" in name and ".weight" in name:
+            return gguf.GGMLQuantizationType.F16
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # decoder tensors (including tied tok_embeddings) are handled by the text
+        # converter; only the audio encoder + adapter live under this prefix
+        if name.startswith("layers.") or name == "norm.weight":
+            return
+        if name == "mm_streams_embeddings.embedding_module.tok_embeddings.weight":
+            return
+
+        name = name.replace("mm_streams_embeddings.embedding_module.", "")
+
+        # ggml_conv_1d bias needs a 3rd dim, same as WhisperEncoderModel above
+        if "conv_layers" in name and name.endswith(".bias"):
+            data_torch = data_torch.unsqueeze(-1)
+
+        # GGUF conv/adapter tensor names are 1-indexed
+        if "conv_layers.0" in name:
+            name = name.replace("conv_layers.0", "conv_layers.1")
+        elif "conv_layers.1" in name:
+            name = name.replace("conv_layers.1", "conv_layers.2")
+        if "audio_language_projection.2" in name:
+            # the adapter is Sequential(Linear, GELU, Linear): index 1 is the (weightless)
+            # activation, so the 2nd Linear needs to collapse onto bid=1 for A_MMPROJ
+            name = name.replace("audio_language_projection.2", "audio_language_projection.1")
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
 @ModelBase.register("AudioFlamingo3ForConditionalGeneration")
 class AudioFlamingo3WhisperEncoderModel(WhisperEncoderModel):
     def set_gguf_parameters(self):

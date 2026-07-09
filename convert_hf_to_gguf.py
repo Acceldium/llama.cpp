@@ -244,9 +244,15 @@ def main() -> None:
                 logger.error(f"Model {model_architecture} is not supported")
                 sys.exit(1)
         elif args.mmproj:
-            assert hparams.get("vision_encoder") is not None, "This model does not support multimodal"
-            from conversion.pixtral import PixtralModel
-            model_class = PixtralModel
+            if hparams.get("vision_encoder") is not None:
+                from conversion.pixtral import PixtralModel
+                model_class = PixtralModel
+            elif hparams.get("multimodal") is not None:
+                # Voxtral Realtime audio encoder (Mistral format with a "multimodal" config)
+                from conversion.ultravox import VoxtralRealtimeEncoderModel
+                model_class = VoxtralRealtimeEncoderModel
+            else:
+                raise ValueError("This model does not support multimodal (no vision_encoder or multimodal config found)")
         elif hparams.get("moe") is not None:
             from conversion.mistral import MistralMoeModel
             model_class = MistralMoeModel

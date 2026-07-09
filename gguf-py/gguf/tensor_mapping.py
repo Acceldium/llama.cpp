@@ -2068,6 +2068,7 @@ class TensorNameMap:
             "conformer.pre_encode.conv.{bid}", # lfm2
             "model.audio_tower.subsample_conv_projection.conv_{bid}.conv", # gemma3n
             "conformer.subsample_conv_projection.layer{bid}.conv", # gemma4
+            "whisper_encoder.conv_layers.{bid}.conv", # voxtral realtime (remapped in modify_tensors)
         ),
 
         MODEL_TENSOR.A_ENC_CONV1D_NORM: (
@@ -2092,6 +2093,7 @@ class TensorNameMap:
         MODEL_TENSOR.A_POST_NORM: (
             "audio_tower.layer_norm", # ultravox
             "audio_tower.ln_post", # qwen2omni
+            "whisper_encoder.transformer.norm", # voxtral realtime (remapped in modify_tensors)
         ),
 
         MODEL_TENSOR.A_ENC_ATTN_Q: (
@@ -2100,6 +2102,7 @@ class TensorNameMap:
             "conformer.layers.{bid}.attention.attn.q_proj", # gemma3n
             "conformer.layers.{bid}.self_attn.q_proj", # gemma4
             "encoder.layers.{bid}.attn.to_q", # granite_speech
+            "whisper_encoder.transformer.layers.{bid}.attention.wq", # voxtral realtime (remapped in modify_tensors)
         ),
 
         MODEL_TENSOR.A_ENC_ATTN_K: (
@@ -2108,6 +2111,7 @@ class TensorNameMap:
             "conformer.layers.{bid}.attention.attn.k_proj", # gemma3n
             "conformer.layers.{bid}.self_attn.k_proj", # gemma4
             "encoder.layers.{bid}.attn.to_k", # granite_speech (split from to_kv)
+            "whisper_encoder.transformer.layers.{bid}.attention.wk", # voxtral realtime (remapped in modify_tensors)
         ),
 
         MODEL_TENSOR.A_ENC_ATTN_V: (
@@ -2116,6 +2120,7 @@ class TensorNameMap:
             "conformer.layers.{bid}.attention.attn.v_proj", # gemma3n
             "conformer.layers.{bid}.self_attn.v_proj", # gemma4
             "encoder.layers.{bid}.attn.to_v", # granite_speech (split from to_kv)
+            "whisper_encoder.transformer.layers.{bid}.attention.wv", # voxtral realtime (remapped in modify_tensors)
         ),
 
         MODEL_TENSOR.A_ENC_ATTN_K_REL: (
@@ -2144,6 +2149,7 @@ class TensorNameMap:
             "conformer.layers.{bid}.norm_self_att", # lfm2
             "conformer.layers.{bid}.attention.pre_attn_norm", # gemma3n
             "encoder.layers.{bid}.attn.pre_norm", # granite_speech
+            "whisper_encoder.transformer.layers.{bid}.attention_norm", # voxtral realtime (remapped in modify_tensors)
         ),
 
         MODEL_TENSOR.A_ENC_OUTPUT: (
@@ -2152,6 +2158,7 @@ class TensorNameMap:
             "conformer.layers.{bid}.attention.post", # gemma3n
             "conformer.layers.{bid}.self_attn.post", # gemma4
             "encoder.layers.{bid}.attn.to_out", # granite_speech
+            "whisper_encoder.transformer.layers.{bid}.attention.wo", # voxtral realtime (remapped in modify_tensors)
         ),
 
         MODEL_TENSOR.A_ENC_OUTPUT_NORM: (
@@ -2159,6 +2166,7 @@ class TensorNameMap:
             "conformer.layers.{bid}.norm_out", # lfm2
             "conformer.layers.{bid}.attention.post_norm", # gemma3n
             "encoder.layers.{bid}.post_norm", # granite_speech
+            "whisper_encoder.transformer.layers.{bid}.ffn_norm", # voxtral realtime (remapped in modify_tensors)
         ),
 
         MODEL_TENSOR.A_ENC_FFN_NORM: (
@@ -2183,9 +2191,12 @@ class TensorNameMap:
             "conformer.layers.{bid}.ffw_layer_start.ffw_layer_1", # gemma3n
             "conformer.layers.{bid}.feed_forward1.ffw_layer_1", # gemma4
             "encoder.layers.{bid}.ff1.up_proj", # granite_speech
+            "whisper_encoder.transformer.layers.{bid}.feed_forward.w3", # voxtral realtime (remapped in modify_tensors)
         ),
 
-        MODEL_TENSOR.A_ENC_FFN_GATE: (),
+        MODEL_TENSOR.A_ENC_FFN_GATE: (
+            "whisper_encoder.transformer.layers.{bid}.feed_forward.w1", # voxtral realtime (remapped in modify_tensors)
+        ),
 
         MODEL_TENSOR.A_ENC_FFN_DOWN: (
             "audio_tower.layers.{bid}.fc2", # ultravox
@@ -2193,6 +2204,7 @@ class TensorNameMap:
             "conformer.layers.{bid}.ffw_layer_start.ffw_layer_2", # gemma3n
             "conformer.layers.{bid}.feed_forward1.ffw_layer_2", # gemma4
             "encoder.layers.{bid}.ff1.down_proj", # granite_speech
+            "whisper_encoder.transformer.layers.{bid}.feed_forward.w2", # voxtral realtime (remapped in modify_tensors)
         ),
 
         MODEL_TENSOR.A_ENC_FFN_UP_1: (
@@ -2251,6 +2263,7 @@ class TensorNameMap:
             "audio.multi_modal_projector.linear_{bid}", # ultravox, meralion
             "audio_adapter.model.{bid}", # lfm2
             "audio_tower.proj{bid}", # qwen3omni
+            "audio_language_projection.{bid}", # voxtral realtime (remapped in modify_tensors)
         ),
 
         MODEL_TENSOR.A_MMPROJ_FC: (

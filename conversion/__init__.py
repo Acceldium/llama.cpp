@@ -303,6 +303,7 @@ MMPROJ_MODEL_MAP: dict[str, str] = {
     "UltravoxModel": "ultravox",
     "UnlimitedOCRForCausalLM": "deepseek",
     "VoxtralForConditionalGeneration": "ultravox",
+    "VoxtralRealtimeForConditionalGeneration": "ultravox",
     "YoutuVLForConditionalGeneration": "youtuvl",
 }
 

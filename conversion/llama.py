@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 
 from typing import Callable, Iterable, TYPE_CHECKING
 
@@ -33,6 +34,11 @@ class LlamaModel(TextModel):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Voxtral Realtime: per-instance state for the ada_rms_norm_t_cond precompute
+        # (must not be a shared mutable class attribute, since one process can convert
+        # more than one model instance)
+        self._ada_norm_down = {}
+        self._ada_time_embd = None
         # fix for SmolVLM2, missing `num_attention_heads` in config.json
         if self.hf_arch == "VLlama3ForCausalLM":
             self.hparams["num_attention_heads"] = self.hparams.get("num_attention_heads", 32)
@@ -182,12 +188,38 @@ class LlamaModel(TextModel):
 
     _experts: list[dict[str, Tensor]] | None = None
 
+    # Voxtral Realtime: precomputed adaptive RMSNorm (ada_rms_norm_t_cond) state
+    # (actual values are set per-instance in __init__, not shared across instances)
+    _ada_norm_down: dict[int, Tensor]  # layer_id -> down projection tensor
+    _ada_time_embd: Tensor | None      # precomputed time embedding
+
+    def _get_ada_time_embedding(self, dim: int) -> Tensor:
+        """Sinusoidal time embedding for ada_rms_norm_t_cond, pinned to the model's
+        default 480ms (6-frame) transcription delay."""
+        if self._ada_time_embd is None:
+            n_delay_tokens = 6  # 480ms / 80ms per token
+            t_value = float(n_delay_tokens)
+            half_dim = dim // 2
+            inv_freq = torch.exp(-math.log(10000.0) * torch.arange(half_dim).float() / half_dim)
+            emb = t_value * inv_freq
+            self._ada_time_embd = torch.cat([emb.cos(), emb.sin()])
+        return self._ada_time_embd
+
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
         name, gen = item
 
         if "text_model." in name:
             name = name.replace("text_model.", "") # for SmolVLM
+
+        # Voxtral Realtime: tok_embeddings.weight lives under the mmproj-side
+        # mm_streams_embeddings prefix (tied embeddings) but is needed here for the
+        # text decoder; everything else under that prefix belongs to the audio
+        # encoder / adapter and is handled by the mmproj converter instead.
+        if name == "mm_streams_embeddings.embedding_module.tok_embeddings.weight":
+            name = "tok_embeddings.weight"
+        elif "mm_streams_embeddings" in name:
+            return None
 
         return super().filter_tensors((name, gen))
 
@@ -233,6 +265,37 @@ class LlamaModel(TextModel):
             if name.endswith(".hidden_norm.weight"):
                 yield (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_NORM_2, bid), data_torch)
                 return
+
+        # Voxtral Realtime: ada_rms_norm_t_cond is a small per-layer MLP that
+        # conditions the post-FFN-norm scale on the (runtime-configurable) transcription
+        # delay. ggml has no runtime hook for that conditioning, so instead of porting the
+        # MLP into the graph, precompute its output once here for the model's default
+        # delay and bake it into a single per-layer scale tensor (ffn_ada_norm_up); the
+        # down projection is only needed for this precompute and is not written out.
+        if "ada_rms_norm_t_cond" in name:
+            m = re.search(r'layers\.(\d+)\.ada_rms_norm_t_cond\.(\d+)\.weight', name)
+            if m:
+                layer_id = int(m.group(1))
+                sub_id = int(m.group(2))
+                if sub_id == 0:
+                    # down projection [ada_dim, n_embd] - stash for the up-projection pass
+                    self._ada_norm_down[layer_id] = data_torch.float()
+                elif sub_id == 2:
+                    # up projection [n_embd, ada_dim] - compute and emit (1 + ada_scale)
+                    ada_up = data_torch.float()
+                    ada_down = self._ada_norm_down.get(layer_id)
+                    if ada_down is not None:
+                        n_embd = ada_up.shape[0]
+                        t_cond = self._get_ada_time_embedding(n_embd)
+                        ada_hidden = torch.nn.functional.gelu(torch.nn.functional.linear(t_cond, ada_down))
+                        ada_scale = torch.nn.functional.linear(ada_hidden, ada_up)
+                        precomputed = (1.0 + ada_scale).half()
+                        gguf_name = f"blk.{layer_id}.ffn_ada_norm_up.weight"
+                        logger.info(f"Precomputed ada_norm scale for layer {layer_id}: shape={list(precomputed.shape)}")
+                        yield (gguf_name, precomputed)
+                    else:
+                        logger.warning(f"ada_rms_norm_t_cond up projection for layer {layer_id} without matching down projection")
+            return
 
         n_head = self.find_hparam(["n_heads", "num_attention_heads"])
         n_kv_head = self.find_hparam(["n_kv_heads", "num_key_value_heads"])
