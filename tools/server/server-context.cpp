@@ -2884,11 +2884,17 @@ private:
     // emit one generated token: stream it (process_token -> transcript.text.delta) and
     // accumulate word-level timestamps. Streaming control markers are fed back but hidden.
     void as_emit(server_slot & slot, llama_token tok, int pos) {
-        const std::string piece = common_token_to_piece(slot.ctx_tgt, tok, params_base.special);
-        if (piece.find("[STREAMING_PAD]")  != std::string::npos ||
-            piece.find("[STREAMING_WORD]") != std::string::npos) {
+        // Marker detection must always render control tokens (special=true), matching the
+        // reference mtmd-cli.cpp behavior -- independent of the server's --special display
+        // setting (default false). Otherwise piece is "" for these control tokens, the marker
+        // check below never matches, and every pad/word-marker frame leaks through as if it
+        // were real generated content (inflates n_decoded, defeats the n_predict budget).
+        const std::string piece_detect = common_token_to_piece(slot.ctx_tgt, tok, /*special=*/true);
+        if (piece_detect.find("[STREAMING_PAD]")  != std::string::npos ||
+            piece_detect.find("[STREAMING_WORD]") != std::string::npos) {
             return;
         }
+        const std::string piece = common_token_to_piece(slot.ctx_tgt, tok, params_base.special);
         const double t = as_frame_time(pos);
         slot.as_last_t = t;
         slot.as_emit_t = t; // exposed per-delta to the client via oaicompat_asr_start
