@@ -240,8 +240,10 @@ struct llama_layer {
     struct ggml_tensor * attn_sub_norm   = nullptr;
     struct ggml_tensor * attn_post_norm  = nullptr;
     struct ggml_tensor * ffn_sub_norm    = nullptr;
-    struct ggml_tensor * attn_norm_cross = nullptr;
-    struct ggml_tensor * attn_norm_enc   = nullptr;
+    struct ggml_tensor * attn_norm_cross   = nullptr;
+    struct ggml_tensor * attn_norm_cross_b = nullptr;
+    struct ggml_tensor * attn_norm_enc     = nullptr;
+    struct ggml_tensor * attn_norm_enc_b   = nullptr;
     struct ggml_tensor * ssm_norm        = nullptr;
     struct ggml_tensor * ssm_dt_norm     = nullptr;
     struct ggml_tensor * ssm_b_norm      = nullptr;
@@ -273,6 +275,50 @@ struct llama_layer {
     struct ggml_tensor * wo_enc    = nullptr;
     struct ggml_tensor * wqkv_gate = nullptr;
 
+    // cohere-asr: attention biases (self/cross/enc all use plain Linear w/ bias)
+    struct ggml_tensor * bq          = nullptr;
+    struct ggml_tensor * bk          = nullptr;
+    struct ggml_tensor * bv          = nullptr;
+    struct ggml_tensor * bo          = nullptr;
+    struct ggml_tensor * bq_cross    = nullptr;
+    struct ggml_tensor * bk_cross    = nullptr;
+    struct ggml_tensor * bv_cross    = nullptr;
+    struct ggml_tensor * bo_cross    = nullptr;
+    struct ggml_tensor * bq_enc      = nullptr;
+    struct ggml_tensor * bk_enc      = nullptr;
+    struct ggml_tensor * bv_enc      = nullptr;
+    struct ggml_tensor * bo_enc      = nullptr;
+
+    // cohere-asr: Conformer rel-pos attention extras (encoder only)
+    struct ggml_tensor * attn_pos        = nullptr; // linear_pos projection (no bias)
+    struct ggml_tensor * attn_pos_bias_u = nullptr;
+    struct ggml_tensor * attn_pos_bias_v = nullptr;
+
+    // cohere-asr: Conformer macaron 1st half-step FFN (encoder only; the
+    // existing ffn_{norm,up,down}_enc fields are reused for the 2nd half-step)
+    struct ggml_tensor * ffn1_norm_enc   = nullptr;
+    struct ggml_tensor * ffn1_norm_enc_b = nullptr;
+    struct ggml_tensor * ffn1_up_enc     = nullptr;
+    struct ggml_tensor * ffn1_up_enc_b   = nullptr;
+    struct ggml_tensor * ffn1_down_enc   = nullptr;
+    struct ggml_tensor * ffn1_down_enc_b = nullptr;
+
+    // cohere-asr: Conformer convolution module (encoder only)
+    struct ggml_tensor * conv_ln_enc   = nullptr;
+    struct ggml_tensor * conv_ln_enc_b = nullptr;
+    struct ggml_tensor * conv_pw1      = nullptr;
+    struct ggml_tensor * conv_pw1_b    = nullptr;
+    struct ggml_tensor * conv_dw       = nullptr;
+    struct ggml_tensor * conv_dw_b     = nullptr;
+    struct ggml_tensor * conv_bn_w     = nullptr; // folded BatchNorm1d affine scale
+    struct ggml_tensor * conv_bn_b     = nullptr; // folded BatchNorm1d affine shift
+    struct ggml_tensor * conv_pw2      = nullptr;
+    struct ggml_tensor * conv_pw2_b    = nullptr;
+
+    // cohere-asr: per-Conformer-layer final LayerNorm ("norm_out")
+    struct ggml_tensor * norm_out_enc   = nullptr;
+    struct ggml_tensor * norm_out_enc_b = nullptr;
+
     // relative position bias
     struct ggml_tensor * attn_rel_b       = nullptr;
     struct ggml_tensor * attn_rel_b_enc   = nullptr;
@@ -289,6 +335,7 @@ struct llama_layer {
     struct ggml_tensor * layer_out_norm_b = nullptr;
     struct ggml_tensor * ffn_norm_exps    = nullptr;
     struct ggml_tensor * ffn_norm_enc     = nullptr;
+    struct ggml_tensor * ffn_norm_enc_b   = nullptr;
 
     // ff
     struct ggml_tensor * ffn_gate     = nullptr; // w1
@@ -297,6 +344,8 @@ struct llama_layer {
     struct ggml_tensor * ffn_gate_enc = nullptr;
     struct ggml_tensor * ffn_down_enc = nullptr;
     struct ggml_tensor * ffn_up_enc   = nullptr;
+    struct ggml_tensor * ffn_down_enc_b = nullptr;
+    struct ggml_tensor * ffn_up_enc_b   = nullptr;
 
     // ff MoE
     struct ggml_tensor * ffn_gate_inp      = nullptr;
@@ -570,8 +619,27 @@ struct llama_model {
     struct ggml_tensor * output_norm_b   = nullptr;
     struct ggml_tensor * output          = nullptr;
     struct ggml_tensor * output_b        = nullptr;
-    struct ggml_tensor * output_norm_enc = nullptr;
+    struct ggml_tensor * output_norm_enc   = nullptr;
+    struct ggml_tensor * output_norm_enc_b = nullptr;
 
+    // cohere-asr: mel frontend buffers (loaded straight from the checkpoint,
+    // not learned) and Conformer subsampling stem (5 convs: conv0 std,
+    // conv1/conv3 depthwise, conv2/conv4 pointwise; see load_arch_tensors)
+    struct ggml_tensor * mel_fb        = nullptr;
+    struct ggml_tensor * mel_window    = nullptr;
+    struct ggml_tensor * subsample_conv[5]   = {};
+    struct ggml_tensor * subsample_conv_b[5] = {};
+    struct ggml_tensor * subsample_out   = nullptr;
+    struct ggml_tensor * subsample_out_b = nullptr;
+
+    // cohere-asr: encoder_decoder_proj (n_embd_enc -> n_embd), applied once
+    // after the last Conformer layer
+    struct ggml_tensor * enc_output_proj   = nullptr;
+    struct ggml_tensor * enc_output_proj_b = nullptr;
+
+    // cohere-asr: decoder embedding LayerNorm (applied once after token+pos sum)
+    struct ggml_tensor * dec_embd_norm   = nullptr;
+    struct ggml_tensor * dec_embd_norm_b = nullptr;
 
     // NVFP4 per-tensor scale2, input_scale for LM head
     struct ggml_tensor * output_s    = nullptr;

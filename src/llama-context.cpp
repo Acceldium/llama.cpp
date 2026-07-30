@@ -1486,8 +1486,13 @@ int llama_context::encode(const llama_batch & batch_inp) {
                     GGML_ASSERT(embd.data != nullptr);
                     const uint32_t n_embd_out = hparams.n_embd_out();
 
-                    GGML_ASSERT(n_tokens*n_embd_out <= (int64_t) embd.size);
-                    ggml_backend_tensor_get_async(backend_embd, t_embd, embd.data, 0, n_tokens*n_embd_out*sizeof(float));
+                    // t_embd's actual sequence length may be shorter than n_tokens for
+                    // subsampling encoders (e.g. cohere-asr's Conformer stem); for
+                    // archs without subsampling this is always == n_tokens
+                    const int64_t n_embd_out_tokens = t_embd->ne[1];
+
+                    GGML_ASSERT(n_embd_out_tokens*n_embd_out <= (int64_t) embd.size);
+                    ggml_backend_tensor_get_async(backend_embd, t_embd, embd.data, 0, n_embd_out_tokens*n_embd_out*sizeof(float));
                 } break;
             case LLAMA_POOLING_TYPE_MEAN:
             case LLAMA_POOLING_TYPE_CLS:
@@ -1540,7 +1545,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
     }
 
     // TODO: hacky solution
-    if (model.arch == LLM_ARCH_T5 && t_embd) {
+    if ((model.arch == LLM_ARCH_T5 || model.arch == LLM_ARCH_COHERE_ASR) && t_embd) {
         //cross.t_embd = t_embd;
 
         synchronize();
@@ -2088,7 +2093,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     bool has_embd_nextn = cparams.embeddings_nextn;
 
     // TODO: hacky enc-dec support
-    if (model.arch == LLM_ARCH_T5) {
+    if (model.arch == LLM_ARCH_T5 || model.arch == LLM_ARCH_COHERE_ASR) {
         has_logits = true;
         has_embd   = true;
     }

@@ -45,6 +45,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "Cohere2MoeForCausalLM": "command_r",
     "Cohere2ForCausalLM": "command_r",
     "CohereForCausalLM": "command_r",
+    "CohereAsrForConditionalGeneration": "cohere_asr",
     "DbrxForCausalLM": "dbrx",
     "DeciLMForCausalLM": "deci",
     "DeepseekForCausalLM": "deepseek",

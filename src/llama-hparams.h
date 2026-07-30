@@ -269,6 +269,20 @@ struct llama_hparams {
     llama_token dec_start_token_id = LLAMA_TOKEN_NULL;
     uint32_t    dec_n_layer        = 0;
 
+    // needed by encoder-decoder models where the encoder and decoder stacks
+    // have different widths (e.g. cohere-asr: Conformer encoder d_model=1280
+    // vs Transformer decoder hidden=1024). T5 doesn't need these since its
+    // encoder/decoder share `n_embd`/`n_head`/etc.
+    uint32_t n_embd_enc          = 0;
+    uint32_t n_ff_enc            = 0;
+    uint32_t n_head_enc          = 0;
+    uint32_t n_embd_head_k_enc   = 0;
+    uint32_t n_embd_head_v_enc   = 0;
+    uint32_t n_conv_kernel_enc   = 0;
+    uint32_t n_subsampling_factor_enc  = 0;
+    uint32_t n_subsampling_channels_enc = 0;
+    uint32_t n_mel_bins_enc      = 0;
+
     enum llama_pooling_type      pooling_type            = LLAMA_POOLING_TYPE_NONE;
     enum llama_rope_type         rope_type               = LLAMA_ROPE_TYPE_NONE;
     enum llama_rope_scaling_type rope_scaling_type_train = LLAMA_ROPE_SCALING_TYPE_NONE;

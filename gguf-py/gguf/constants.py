@@ -257,6 +257,17 @@ class Keys:
         EMBEDDING_LENGTH = "{arch}.convnext.embedding_length"
         BLOCK_COUNT      = "{arch}.convnext.block_count"
 
+    class Encoder:
+        EMBEDDING_LENGTH     = "{arch}.encoder.embedding_length"
+        FEED_FORWARD_LENGTH  = "{arch}.encoder.feed_forward_length"
+        HEAD_COUNT           = "{arch}.encoder.attention.head_count"
+        KEY_LENGTH           = "{arch}.encoder.attention.key_length"
+        VALUE_LENGTH         = "{arch}.encoder.attention.value_length"
+        CONV_KERNEL_SIZE     = "{arch}.encoder.conv_kernel_size"
+        SUBSAMPLING_FACTOR   = "{arch}.encoder.subsampling_factor"
+        SUBSAMPLING_CHANNELS = "{arch}.encoder.subsampling_channels"
+        FEATURES_COUNT       = "{arch}.encoder.features_count"
+
     class Classifier:
         OUTPUT_LABELS = "{arch}.classifier.output_labels"
 
@@ -501,6 +512,7 @@ class MODEL_ARCH(IntEnum):
     BITNET           = auto()
     T5               = auto()
     T5ENCODER        = auto()
+    COHERE_ASR       = auto()
     JAIS             = auto()
     JAIS2            = auto()
     NEMOTRON         = auto()
@@ -757,6 +769,26 @@ class MODEL_TENSOR(IntEnum):
     ENC_FFN_DOWN         = auto()
     ENC_FFN_UP           = auto()
     ENC_OUTPUT_NORM      = auto()
+    # Conformer-encoder specific (cohere-asr)
+    ENC_MEL_FB           = auto()
+    ENC_MEL_WINDOW       = auto()
+    ENC_SUBSAMPLE_CONV   = auto()
+    ENC_SUBSAMPLE_OUT    = auto()
+    ENC_FFN1_NORM        = auto()
+    ENC_FFN1_UP          = auto()
+    ENC_FFN1_DOWN        = auto()
+    ENC_ATTN_POS         = auto()
+    ENC_ATTN_POS_BIAS_U  = auto()
+    ENC_ATTN_POS_BIAS_V  = auto()
+    ENC_CONV_LN          = auto()
+    ENC_CONV_PW1         = auto()
+    ENC_CONV_DW          = auto()
+    ENC_CONV_BN          = auto()
+    ENC_CONV_PW2         = auto()
+    ENC_NORM_OUT         = auto()
+    ENC_OUTPUT_PROJ      = auto()
+    # cohere-asr decoder embedding norm
+    DEC_EMBD_NORM        = auto()
     CLS                  = auto() # classifier
     CLS_OUT              = auto() # classifier output projection
     CLS_NORM             = auto()
@@ -1112,6 +1144,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.BITNET:           "bitnet",
     MODEL_ARCH.T5:               "t5",
     MODEL_ARCH.T5ENCODER:        "t5encoder",
+    MODEL_ARCH.COHERE_ASR:       "cohere-asr",
     MODEL_ARCH.JAIS:             "jais",
     MODEL_ARCH.JAIS2:            "jais2",
     MODEL_ARCH.NEMOTRON:         "nemotron",
@@ -1367,6 +1400,24 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.ENC_FFN_DOWN:              "enc.blk.{bid}.ffn_down",
     MODEL_TENSOR.ENC_FFN_UP:                "enc.blk.{bid}.ffn_up",
     MODEL_TENSOR.ENC_OUTPUT_NORM:           "enc.output_norm",
+    MODEL_TENSOR.ENC_MEL_FB:                "enc.mel_fb",
+    MODEL_TENSOR.ENC_MEL_WINDOW:            "enc.mel_window",
+    MODEL_TENSOR.ENC_SUBSAMPLE_CONV:        "enc.subsample.{bid}.conv",
+    MODEL_TENSOR.ENC_SUBSAMPLE_OUT:         "enc.subsample.out",
+    MODEL_TENSOR.ENC_FFN1_NORM:             "enc.blk.{bid}.ffn1_norm",
+    MODEL_TENSOR.ENC_FFN1_UP:               "enc.blk.{bid}.ffn1_up",
+    MODEL_TENSOR.ENC_FFN1_DOWN:             "enc.blk.{bid}.ffn1_down",
+    MODEL_TENSOR.ENC_ATTN_POS:              "enc.blk.{bid}.attn_pos",
+    MODEL_TENSOR.ENC_ATTN_POS_BIAS_U:       "enc.blk.{bid}.attn_pos_bias_u",
+    MODEL_TENSOR.ENC_ATTN_POS_BIAS_V:       "enc.blk.{bid}.attn_pos_bias_v",
+    MODEL_TENSOR.ENC_CONV_LN:               "enc.blk.{bid}.conv_ln",
+    MODEL_TENSOR.ENC_CONV_PW1:              "enc.blk.{bid}.conv_pw1",
+    MODEL_TENSOR.ENC_CONV_DW:               "enc.blk.{bid}.conv_dw",
+    MODEL_TENSOR.ENC_CONV_BN:               "enc.blk.{bid}.conv_bn",
+    MODEL_TENSOR.ENC_CONV_PW2:              "enc.blk.{bid}.conv_pw2",
+    MODEL_TENSOR.ENC_NORM_OUT:              "enc.blk.{bid}.norm_out",
+    MODEL_TENSOR.ENC_OUTPUT_PROJ:           "enc.output_proj",
+    MODEL_TENSOR.DEC_EMBD_NORM:             "dec.embd_norm",
     MODEL_TENSOR.CLS:                       "cls",
     MODEL_TENSOR.CLS_OUT:                   "cls.output",
     MODEL_TENSOR.CLS_NORM:                  "cls.norm",
@@ -3539,6 +3590,51 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.ENC_FFN_DOWN,
         MODEL_TENSOR.ENC_FFN_UP,
         MODEL_TENSOR.ENC_OUTPUT_NORM,
+    ],
+    MODEL_ARCH.COHERE_ASR: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.POS_EMBD,
+        MODEL_TENSOR.DEC_EMBD_NORM,
+        MODEL_TENSOR.ENC_MEL_FB,
+        MODEL_TENSOR.ENC_MEL_WINDOW,
+        MODEL_TENSOR.ENC_SUBSAMPLE_CONV,
+        MODEL_TENSOR.ENC_SUBSAMPLE_OUT,
+        MODEL_TENSOR.ENC_FFN1_NORM,
+        MODEL_TENSOR.ENC_FFN1_UP,
+        MODEL_TENSOR.ENC_FFN1_DOWN,
+        MODEL_TENSOR.ENC_ATTN_NORM,
+        MODEL_TENSOR.ENC_ATTN_Q,
+        MODEL_TENSOR.ENC_ATTN_K,
+        MODEL_TENSOR.ENC_ATTN_V,
+        MODEL_TENSOR.ENC_ATTN_OUT,
+        MODEL_TENSOR.ENC_ATTN_POS,
+        MODEL_TENSOR.ENC_ATTN_POS_BIAS_U,
+        MODEL_TENSOR.ENC_ATTN_POS_BIAS_V,
+        MODEL_TENSOR.ENC_CONV_LN,
+        MODEL_TENSOR.ENC_CONV_PW1,
+        MODEL_TENSOR.ENC_CONV_DW,
+        MODEL_TENSOR.ENC_CONV_BN,
+        MODEL_TENSOR.ENC_CONV_PW2,
+        MODEL_TENSOR.ENC_FFN_NORM,
+        MODEL_TENSOR.ENC_FFN_UP,
+        MODEL_TENSOR.ENC_FFN_DOWN,
+        MODEL_TENSOR.ENC_NORM_OUT,
+        MODEL_TENSOR.ENC_OUTPUT_PROJ,
+        MODEL_TENSOR.DEC_ATTN_NORM,
+        MODEL_TENSOR.DEC_ATTN_Q,
+        MODEL_TENSOR.DEC_ATTN_K,
+        MODEL_TENSOR.DEC_ATTN_V,
+        MODEL_TENSOR.DEC_ATTN_OUT,
+        MODEL_TENSOR.DEC_CROSS_ATTN_NORM,
+        MODEL_TENSOR.DEC_CROSS_ATTN_Q,
+        MODEL_TENSOR.DEC_CROSS_ATTN_K,
+        MODEL_TENSOR.DEC_CROSS_ATTN_V,
+        MODEL_TENSOR.DEC_CROSS_ATTN_OUT,
+        MODEL_TENSOR.DEC_FFN_NORM,
+        MODEL_TENSOR.DEC_FFN_UP,
+        MODEL_TENSOR.DEC_FFN_DOWN,
     ],
     MODEL_ARCH.JAIS: [
         MODEL_TENSOR.TOKEN_EMBD,
